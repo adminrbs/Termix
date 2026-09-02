@@ -1,10 +1,16 @@
 /* eslint-disable react-refresh/only-export-components */
 import {
   Box,
+  Boxes,
+  Braces,
   FolderSearch,
+  HardDrive,
   LayoutDashboard,
   LayoutGrid,
+  LayoutPanelLeft,
+  MessagesSquare,
   Monitor,
+  MousePointerClick,
   Network,
   Server,
   Settings,
@@ -14,32 +20,172 @@ import {
   Activity,
   TerminalSquare,
   Layers, // --- tmux-monitor ---
+  Clock,
+  Fingerprint,
+  Hammer,
+  Play,
+  Plug,
+  ScrollText,
+  Sparkles,
+  Workflow,
 } from "lucide-react";
+import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
-import { CommandHistoryProvider } from "@/features/terminal/command-history/CommandHistoryContext";
-import { Serial } from "@/features/serial/Serial";
 import type { SerialHandle } from "@/features/serial/serial-types";
-import { Terminal as TerminalFeature } from "@/features/terminal/Terminal";
 import type {
   TerminalHandle,
   TerminalHostConfig,
 } from "@/features/terminal/Terminal";
-import { MobileTerminalKeyboard } from "@/features/terminal/MobileTerminalKeyboard";
-import { useIsMobile } from "@/hooks/use-mobile";
-import { FileManager } from "@/features/file-manager/FileManager";
-import { DockerManager } from "@/features/docker/DockerManager";
-import { HostMetricsTab } from "@/features/host-metrics/HostMetricsTab";
-// --- tmux-monitor ---
-import { TmuxMonitor } from "@/features/tmux-monitor/TmuxMonitor";
-import GuacamoleApp from "@/features/guacamole/GuacamoleApp";
 import type { GuacamoleAppHandle } from "@/features/guacamole/GuacamoleApp";
-import { DashboardTab } from "@/dashboard/DashboardTab";
-import { HomepageCanvas } from "@/features/homepage/HomepageCanvas";
-import { TunnelTab } from "@/features/tunnel/TunnelTab";
-import { NetworkGraphCard } from "@/dashboard/cards/NetworkGraphCard";
+import { useIsMobile } from "@/hooks/use-mobile";
 import type { Tab, TabType, Host } from "@/types/ui-types";
 import type { SSHHost } from "@/types";
 import { useTabsSafe } from "@/shell/TabContext";
+import {
+  markAdaptiveResourceUsed,
+  runAdaptiveBackgroundTask,
+} from "@/lib/adaptive-resource-budget";
+
+// Heavy tab surfaces — keep out of the AppShell critical path.
+const CommandHistoryProvider = lazy(() =>
+  import("@/features/terminal/command-history/CommandHistoryContext").then(
+    (m) => ({ default: m.CommandHistoryProvider }),
+  ),
+);
+const loadTerminalFeature = () =>
+  import("@/features/terminal/Terminal").then((m) => ({
+    default: m.Terminal,
+  }));
+const TerminalFeature = lazy(loadTerminalFeature);
+const LocalTerminal = lazy(() =>
+  import("@/features/local-terminal/LocalTerminal").then((m) => ({
+    default: m.LocalTerminal,
+  })),
+);
+const MobileTerminalKeyboard = lazy(() =>
+  import("@/features/terminal/MobileTerminalKeyboard").then((m) => ({
+    default: m.MobileTerminalKeyboard,
+  })),
+);
+const loadFileManager = () =>
+  import("@/features/file-manager/FileManager").then((m) => ({
+    default: m.FileManager,
+  }));
+const FileManager = lazy(loadFileManager);
+const loadDockerManager = () =>
+  import("@/features/docker/DockerManager").then((m) => ({
+    default: m.DockerManager,
+  }));
+const DockerManager = lazy(loadDockerManager);
+const loadHostMetricsTab = () =>
+  import("@/features/host-metrics/HostMetricsTab").then((m) => ({
+    default: m.HostMetricsTab,
+  }));
+const HostMetricsTab = lazy(loadHostMetricsTab);
+const loadProxmoxStatsTab = () =>
+  import("@/features/proxmox-stats/ProxmoxStatsTab").then((m) => ({
+    default: m.ProxmoxStatsTab,
+  }));
+const ProxmoxStatsTab = lazy(loadProxmoxStatsTab);
+const loadTmuxMonitor = () =>
+  import("@/features/tmux-monitor/TmuxMonitor").then((m) => ({
+    default: m.TmuxMonitor,
+  }));
+const TmuxMonitor = lazy(loadTmuxMonitor);
+const loadGuacamoleApp = () =>
+  import("@/features/guacamole/GuacamoleApp").then((m) => ({
+    default: m.default,
+  }));
+const GuacamoleApp = lazy(loadGuacamoleApp);
+const DashboardTab = lazy(() =>
+  import("@/dashboard/DashboardTab").then((m) => ({
+    default: m.DashboardTab,
+  })),
+);
+const HomepageCanvas = lazy(() =>
+  import("@/features/homepage/HomepageCanvas").then((m) => ({
+    default: m.HomepageCanvas,
+  })),
+);
+const loadTunnelTab = () =>
+  import("@/features/tunnel/TunnelTab").then((m) => ({
+    default: m.TunnelTab,
+  }));
+const TunnelTab = lazy(loadTunnelTab);
+const NetworkGraphCard = lazy(() =>
+  import("@/dashboard/cards/NetworkGraphCard").then((m) => ({
+    default: m.NetworkGraphCard,
+  })),
+);
+const Serial = lazy(() =>
+  import("@/features/serial/Serial").then((m) => ({
+    default: m.Serial,
+  })),
+);
+const FleetInventoryTab = lazy(() =>
+  import("@/sidebar/FleetInventoryTab").then((m) => ({
+    default: m.FleetInventoryTab,
+  })),
+);
+
+// Rail panels promoted to full tabs.
+const TermixIdPanel = lazy(() =>
+  import("@/sidebar/TermixIdPanel").then((m) => ({ default: m.TermixIdPanel })),
+);
+const AlertsPanel = lazy(() =>
+  import("@/sidebar/AlertsPanel").then((m) => ({ default: m.AlertsPanel })),
+);
+const SessionLogsPanel = lazy(() =>
+  import("@/sidebar/SessionLogsPanel").then((m) => ({
+    default: m.SessionLogsPanel,
+  })),
+);
+const SnippetsPanel = lazy(() =>
+  import("@/sidebar/SnippetsPanel").then((m) => ({ default: m.SnippetsPanel })),
+);
+const MacrosPanel = lazy(() =>
+  import("@/sidebar/MacrosPanel").then((m) => ({ default: m.MacrosPanel })),
+);
+const HistoryPanel = lazy(() =>
+  import("@/sidebar/HistoryPanel").then((m) => ({ default: m.HistoryPanel })),
+);
+const SshToolsPanel = lazy(() =>
+  import("@/sidebar/SshToolsPanel").then((m) => ({ default: m.SshToolsPanel })),
+);
+const AutomationsPanel = lazy(() =>
+  import("@/sidebar/AutomationsPanel").then((m) => ({
+    default: m.AutomationsPanel,
+  })),
+);
+
+const AiPanel = lazy(() =>
+  import("@/features/ai/AiPanel").then((m) => ({
+    default: m.AiPanel,
+  })),
+);
+
+const tabSurfaceLoaders: Partial<Record<TabType, () => Promise<unknown>>> = {
+  terminal: loadTerminalFeature,
+  files: loadFileManager,
+  docker: loadDockerManager,
+  "host-metrics": loadHostMetricsTab,
+  "proxmox-stats": loadProxmoxStatsTab,
+  tmux_monitor: loadTmuxMonitor,
+  tunnel: loadTunnelTab,
+  rdp: loadGuacamoleApp,
+  vnc: loadGuacamoleApp,
+  telnet: loadGuacamoleApp,
+};
+
+/** Download a likely next tab without starting a connection or mounting UI. */
+export function preloadTabSurface(type: TabType): void {
+  const loader = tabSurfaceLoaders[type];
+  if (loader) runAdaptiveBackgroundTask("module", `tab:${type}`, loader);
+}
+
+export function markTabSurfaceUsed(type: TabType): void {
+  markAdaptiveResourceUsed("module", `tab:${type}`);
+}
 
 function hostToSSHHost(h: Host): SSHHost {
   return {
@@ -53,15 +199,20 @@ function hostToSSHHost(h: Host): SSHHost {
     pin: h.pin ?? false,
     authType: h.authType,
     password: h.password,
+    hasPassword: h.hasPassword,
     key: h.key,
     keyPassword: h.keyPassword,
+    hasKey: h.hasKey,
+    hasKeyPassword: h.hasKeyPassword,
     keyType: h.keyType,
     credentialId: h.credentialId ? parseInt(h.credentialId, 10) : undefined,
     terminalConfig: h.terminalConfig,
+    hasSudoPassword: h.hasSudoPassword,
     enableTerminal: h.enableTerminal ?? false,
     enableTunnel: h.enableTunnel ?? false,
     enableFileManager: h.enableFileManager ?? false,
     enableDocker: h.enableDocker ?? false,
+    dockerConfig: h.dockerConfig ?? null,
     showTerminalInSidebar: true,
     showFileManagerInSidebar: true,
     showTunnelInSidebar: true,
@@ -70,9 +221,13 @@ function hostToSSHHost(h: Host): SSHHost {
     defaultPath: h.defaultPath ?? "",
     tunnelConnections: [],
     connectionType: "ssh",
+    connectionOrigin: h.connectionOrigin ?? null,
+    // Carries the host's identity to a delegated backend. Without it the
+    // remote side resolves our local row id against its own table.
+    syncId: h.syncId ?? null,
     createdAt: "",
     updatedAt: "",
-  } as SSHHost;
+  } as unknown as SSHHost;
 }
 
 function EmptyState({
@@ -95,20 +250,51 @@ function EmptyState({
   );
 }
 
+function TabChunkFallback() {
+  return (
+    <div className="flex h-full w-full items-center justify-center bg-background">
+      <div className="size-5 rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground/70 animate-spin" />
+    </div>
+  );
+}
+
+function withTabSuspense(node: React.ReactNode) {
+  return <Suspense fallback={<TabChunkFallback />}>{node}</Suspense>;
+}
+
+/**
+ * Host frame for rail panels opened as tabs. Panels expect a full-height flex
+ * column like the sidebar gives them. The max width keeps forms readable on a
+ * wide monitor instead of stretching them edge to edge.
+ */
+function PanelTabFrame({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex h-full w-full justify-center overflow-y-auto bg-background">
+      <div className="flex flex-col flex-1 min-h-0 w-full max-w-5xl">
+        {children}
+      </div>
+    </div>
+  );
+}
+
 export function tabIcon(type: TabType) {
   switch (type) {
     case "dashboard":
       return <LayoutDashboard className="size-3.5" />;
     case "terminal":
       return <Terminal className="size-3.5" />;
+    case "local-terminal":
+      return <TerminalSquare className="size-3.5" />;
     case "rdp":
       return <Monitor className="size-3.5" />;
     case "vnc":
-      return <Monitor className="size-3.5" />;
+      return <MousePointerClick className="size-3.5" />;
     case "telnet":
-      return <Terminal className="size-3.5" />;
+      return <MessagesSquare className="size-3.5" />;
     case "host-metrics":
       return <Server className="size-3.5" />;
+    case "proxmox-stats":
+      return <HardDrive className="size-3.5" />;
     case "files":
       return <FolderSearch className="size-3.5" />;
     case "host-manager":
@@ -130,6 +316,28 @@ export function tabIcon(type: TabType) {
       return <Usb className="size-3.5" />;
     case "homepage":
       return <LayoutGrid className="size-3.5" />;
+    case "fleet-inventory":
+      return <Boxes className="size-3.5" />;
+    case "termix-id":
+      return <Fingerprint className="size-3.5" />;
+    case "alerts":
+      return <Plug className="size-3.5" />;
+    case "session-logs":
+      return <ScrollText className="size-3.5" />;
+    case "snippets":
+      return <Play className="size-3.5" />;
+    case "macros":
+      return <Braces className="size-3.5" />;
+    case "history":
+      return <Clock className="size-3.5" />;
+    case "ssh-tools":
+      return <Hammer className="size-3.5" />;
+    case "automations":
+      return <Workflow className="size-3.5" />;
+    case "ai":
+      return <Sparkles className="size-3.5" />;
+    case "split-screen":
+      return <LayoutPanelLeft className="size-3.5" />;
   }
 }
 
@@ -138,23 +346,29 @@ function TerminalTabContent({
   host,
   label,
   isVisible,
+  isFocusedPane,
   onCloseTab,
   onRenameTab,
   onOpenFileInEditor,
   onOpenFileManager,
+  onOpenTab,
+  onSaveQuickConnect,
 }: {
   tab: Tab;
   host: Host;
   label: string;
   isVisible: boolean;
+  isFocusedPane: boolean;
   onCloseTab?: (id: string) => void;
   onRenameTab?: (tabId: string, newLabel: string) => void;
   onOpenFileInEditor?: (filePath: string) => void;
   onOpenFileManager?: (path?: string) => void;
+  onOpenTab?: (type: TabType) => void;
+  onSaveQuickConnect?: () => Promise<void>;
 }) {
   const { previewTerminalTheme } = useTabsSafe();
   const isMobile = useIsMobile();
-  return (
+  return withTabSuspense(
     <CommandHistoryProvider>
       <div className="flex flex-col h-full w-full">
         <div className="flex-1 min-h-0">
@@ -166,6 +380,8 @@ function TerminalTabContent({
                 sshPort: host.sshPort ?? host.port,
                 instanceId: tab.instanceId ?? tab.id,
                 restoredSessionId: tab.restoredSessionId ?? null,
+                joinSharedSessionId: tab.joinSharedSessionId ?? null,
+                joinShareId: tab.joinShareId ?? null,
               } as TerminalHostConfig
             }
             isVisible={isVisible}
@@ -182,6 +398,11 @@ function TerminalTabContent({
             previewTheme={previewTerminalTheme}
             onOpenFileInEditor={onOpenFileInEditor}
             onOpenFileManager={onOpenFileManager}
+            isQuickConnect={host.id.startsWith("quick-connect-")}
+            onSaveQuickConnect={onSaveQuickConnect}
+            host={host}
+            onOpenTab={onOpenTab}
+            isFocusedPane={isFocusedPane}
           />
         </div>
         {isMobile && (
@@ -192,9 +413,20 @@ function TerminalTabContent({
           />
         )}
       </div>
-    </CommandHistoryProvider>
+    </CommandHistoryProvider>,
   );
 }
+
+/**
+ * Everything the promoted rail panels need from AppShell. Passed as one bag
+ * rather than more positional params, which renderTabContent already has too
+ * many of.
+ */
+export type PromotedPanelProps = {
+  terminalTabs?: Tab[];
+  targetTerminalTabId?: string;
+  storageMode?: "local" | "cloud";
+};
 
 export function renderTabContent(
   tab: Tab,
@@ -206,16 +438,20 @@ export function renderTabContent(
   onOpenFileManager?: (host: Host, path?: string) => void,
   onOpenTerminalTab?: (host: Host, path?: string) => void,
   onRenameTab?: (tabId: string, newLabel: string) => void,
+  onSaveQuickConnect?: (tab: Tab, host: Host) => Promise<void>,
+  isFocusedPane = true,
+  panelProps?: PromotedPanelProps,
 ) {
   const { host, label } = tab;
 
   switch (tab.type) {
     case "dashboard":
-      return (
+      return withTabSuspense(
         <DashboardTab
           onOpenSingletonTab={onOpenSingletonTab!}
           onOpenTab={onOpenTab!}
-        />
+          isVisible={isVisible}
+        />,
       );
 
     case "terminal":
@@ -232,6 +468,7 @@ export function renderTabContent(
           host={host}
           label={label}
           isVisible={isVisible}
+          isFocusedPane={isFocusedPane}
           onCloseTab={onCloseTab}
           onRenameTab={onRenameTab}
           onOpenFileInEditor={
@@ -242,7 +479,16 @@ export function renderTabContent(
           onOpenFileManager={
             onOpenFileManager ? (p) => onOpenFileManager(host, p) : undefined
           }
+          onOpenTab={onOpenTab ? (type) => onOpenTab(host, type) : undefined}
+          onSaveQuickConnect={
+            onSaveQuickConnect ? () => onSaveQuickConnect(tab, host) : undefined
+          }
         />
+      );
+
+    case "local-terminal":
+      return withTabSuspense(
+        <LocalTerminal instanceId={tab.instanceId} isVisible={isVisible} />,
       );
 
     case "files":
@@ -253,29 +499,31 @@ export function renderTabContent(
             messageKey="fileManager.noHostSelected"
           />
         );
-      return (
+      return withTabSuspense(
         <FileManager
           initialHost={hostToSSHHost(host)}
           initialFilePath={tab.initialFilePath}
+          initialPath={tab.initialPath}
+          isVisible={isVisible}
           onOpenTerminalTab={
             onOpenTerminalTab
               ? (path) => onOpenTerminalTab(host, path)
               : undefined
           }
-        />
+        />,
       );
 
     case "docker":
       if (!host)
         return <EmptyState icon={Box} messageKey="docker.noHostSelected" />;
-      return (
+      return withTabSuspense(
         <DockerManager
           hostConfig={hostToSSHHost(host)}
           title={label}
           isVisible={isVisible}
           isTopbarOpen={false}
           embedded={true}
-        />
+        />,
       );
 
     case "host-metrics":
@@ -283,18 +531,38 @@ export function renderTabContent(
         return (
           <EmptyState icon={Activity} messageKey="hostMetrics.noHostSelected" />
         );
-      return (
+      return withTabSuspense(
         <HostMetricsTab
           hostConfig={hostToSSHHost(host)}
           title={label}
           isVisible={isVisible}
           isTopbarOpen={false}
           embedded={true}
-        />
+        />,
+      );
+
+    case "proxmox-stats":
+      if (!host)
+        return (
+          <EmptyState
+            icon={HardDrive}
+            messageKey="proxmoxStats.noHostSelected"
+          />
+        );
+      return withTabSuspense(
+        <ProxmoxStatsTab
+          hostConfig={hostToSSHHost(host)}
+          title={label}
+          isVisible={isVisible}
+          isTopbarOpen={false}
+          embedded={true}
+        />,
       );
 
     case "tunnel":
-      return <TunnelTab label={label} host={host} />;
+      return withTabSuspense(
+        <TunnelTab label={label} host={host} isVisible={isVisible} />,
+      );
 
     case "rdp":
     case "vnc":
@@ -303,41 +571,129 @@ export function renderTabContent(
         return (
           <EmptyState icon={Monitor} messageKey="guacamole.noHostSelected" />
         );
-      return (
+      return withTabSuspense(
         <GuacamoleApp
           ref={tab.terminalRef as React.Ref<GuacamoleAppHandle>}
           hostId={host.id}
           tabId={tab.id}
           protocol={tab.type as "rdp" | "vnc" | "telnet"}
-        />
+          isVisible={isVisible}
+        />,
       );
 
     case "network_graph":
-      return <NetworkGraphCard embedded={false} />;
+      return withTabSuspense(
+        <NetworkGraphCard embedded={false} isVisible={isVisible} />,
+      );
 
     // --- tmux-monitor ---
     case "tmux_monitor":
-      return (
+      return withTabSuspense(
         <TmuxMonitor
           initialHostId={host ? parseInt(host.id, 10) : undefined}
           isVisible={isVisible}
-        />
+        />,
       );
 
     case "serial":
       if (!tab.serialConfig)
         return <EmptyState icon={Usb} messageKey="serial.notSupportedTitle" />;
-      return (
+      return withTabSuspense(
         <Serial
           ref={tab.terminalRef as React.Ref<SerialHandle>}
           config={tab.serialConfig}
           isVisible={isVisible}
           instanceId={tab.instanceId}
-        />
+        />,
       );
 
     case "homepage":
-      return <HomepageCanvas />;
+      return withTabSuspense(<HomepageCanvas />);
+
+    case "fleet-inventory":
+      return withTabSuspense(
+        <FleetInventoryTab fleetId={tab.fleetId} isVisible={isVisible} />,
+      );
+
+    case "termix-id":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <TermixIdPanel />
+        </PanelTabFrame>,
+      );
+
+    case "alerts":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <AlertsPanel />
+        </PanelTabFrame>,
+      );
+
+    case "session-logs":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <SessionLogsPanel />
+        </PanelTabFrame>,
+      );
+
+    case "automations":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <AutomationsPanel active={isVisible} />
+        </PanelTabFrame>,
+      );
+
+    case "ai":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <AiPanel />
+        </PanelTabFrame>,
+      );
+
+    case "split-screen":
+      return null;
+
+    case "snippets":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <SnippetsPanel
+            terminalTabs={panelProps?.terminalTabs ?? []}
+            activeTabId={panelProps?.targetTerminalTabId ?? ""}
+            storageMode={panelProps?.storageMode ?? "local"}
+          />
+        </PanelTabFrame>,
+      );
+
+    case "macros":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <MacrosPanel
+            terminalTabs={panelProps?.terminalTabs ?? []}
+            activeTabId={panelProps?.targetTerminalTabId ?? ""}
+            storageMode={panelProps?.storageMode ?? "local"}
+          />
+        </PanelTabFrame>,
+      );
+
+    case "history":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <HistoryPanel
+            terminalTabs={panelProps?.terminalTabs ?? []}
+            activeTabId={panelProps?.targetTerminalTabId ?? ""}
+          />
+        </PanelTabFrame>,
+      );
+
+    case "ssh-tools":
+      return withTabSuspense(
+        <PanelTabFrame>
+          <SshToolsPanel
+            terminalTabs={panelProps?.terminalTabs ?? []}
+            activeTabId={panelProps?.targetTerminalTabId ?? ""}
+          />
+        </PanelTabFrame>,
+      );
 
     case "host-manager":
     case "user-profile":

@@ -1,6 +1,15 @@
+import type { GuacamoleConfig } from "./guacamole-config.js";
+import type { StatsConfig } from "./stats-widgets.js";
 import type { Client } from "ssh2";
 import type { Request } from "express";
 import type { RefObject } from "react";
+import type { HostAuthOverrides } from "./auth-protocols.js";
+
+export type {
+  AuthOverrideProtocol,
+  HostAuthOverrideState,
+  HostAuthOverrides,
+} from "./auth-protocols.js";
 
 // ============================================================================
 // SSO / AUTHENTICATION PROVIDER TYPES
@@ -59,20 +68,35 @@ export interface LDAPProviderConfig {
 
 export type ConnectionType = "ssh" | "rdp" | "vnc" | "telnet";
 export type SSHAuthType =
-  | "password"
-  | "key"
-  | "credential"
-  | "none"
-  | "opkssh"
-  | "tailscale";
+  "password" | "key" | "credential" | "none" | "opkssh" | "tailscale";
 
 export type GuacamoleAuthType = "password" | "credential";
 
+export interface ProxmoxStatsConfig {
+  nodeName?: string | null;
+  pollInterval?: number;
+  enabledCards?: string[];
+}
+
 export interface ProxmoxConfig {
   defaultCredentialId: number | null;
+  defaultAuthType?: string;
   windowsPatterns: string;
   dockerPatterns: string;
   preferredPrefixes: string;
+  autoSyncEnabled?: boolean;
+  syncIntervalMinutes?: number;
+  markMissingGuests?: boolean;
+  lastSyncAt?: string;
+  lastSyncStatus?: "success" | "error";
+  lastSyncError?: string | null;
+  lastSyncResult?: {
+    created: number;
+    updated: number;
+    markedMissing: number;
+    skipped: number;
+    errors: string[];
+  };
 }
 
 export interface HostFeatureFlags {
@@ -81,6 +105,7 @@ export interface HostFeatureFlags {
   enableFileManager: boolean; // SSH only
   enableDocker: boolean; // SSH only
   enableTmuxMonitor: boolean; // SSH only
+  enableTerminalToolbar: boolean; // SSH only
   enableRemoteDesktop: boolean; // RDP, VNC only
 }
 
@@ -93,7 +118,7 @@ export interface QuickAction {
   snippetId: number;
 }
 
-export interface Host {
+export type Host = {
   id: number;
   name: string;
   ip: string;
@@ -109,8 +134,10 @@ export interface Host {
     | "none"
     | "opkssh"
     | "tailscale"
-    | "agent";
+    | "agent"
+    | "vault";
   useWarpgate?: boolean;
+  shareSshAuth?: boolean;
   password?: string;
   key?: string;
   keyPassword?: string;
@@ -123,6 +150,8 @@ export interface Host {
   autostartKeyPassword?: string;
 
   credentialId?: number;
+  vaultProfileId?: number | null;
+  vaultProfile?: { id?: number | null };
   overrideCredentialUsername?: boolean;
   userId?: string;
   enableTerminal: boolean;
@@ -134,7 +163,11 @@ export interface Host {
   enableDocker: boolean;
   enableProxmox: boolean;
   enableTmuxMonitor: boolean;
+  enableTerminalToolbar: boolean;
+  allowSessionSharing?: boolean;
   proxmoxConfig?: ProxmoxConfig | null;
+  enableProxmoxStats: boolean;
+  proxmoxStatsConfig?: ProxmoxStatsConfig | null;
   showTerminalInSidebar: boolean;
   showFileManagerInSidebar: boolean;
   showTunnelInSidebar: boolean;
@@ -144,8 +177,8 @@ export interface Host {
   tunnelConnections: TunnelConnection[];
   jumpHosts?: JumpHost[];
   quickActions?: QuickAction[];
-  statsConfig?: string | Record<string, unknown>;
-  terminalConfig?: TerminalConfig;
+  statsConfig?: string | StatsConfig;
+  terminalConfig?: Partial<TerminalConfig>;
   notes?: string;
 
   useSocks5?: boolean;
@@ -167,7 +200,7 @@ export interface Host {
   domain?: string;
   security?: string;
   ignoreCert?: boolean;
-  guacamoleConfig?: string | Record<string, unknown>;
+  guacamoleConfig?: string | GuacamoleConfig;
   dockerConfig?: Record<string, unknown> | null;
 
   enableSsh?: boolean;
@@ -190,19 +223,41 @@ export interface Host {
   telnetUser?: string;
   telnetPassword?: string;
   telnetCredentialId?: number | null;
-  rdpAuthType?: "direct" | "credential" | null;
+  rdpAuthType?: "direct" | "credential" | "none" | null;
   vncAuthType?: "direct" | "credential" | null;
   telnetAuthType?: "direct" | "credential" | null;
+  /**
+   * Stable identity across a desktop/server sync pair. `id` is an
+   * autoincrement local to whichever database produced the row, so it cannot
+   * name the same host on both sides; this can. Absent on hosts that have
+   * never been part of a sync.
+   */
+  syncId?: string | null;
   createdAt: string;
   updatedAt: string;
 
+  sortOrder?: number | null;
+  connectionOrigin?: "local" | "remote" | null;
+
+  /** Assigned when a host is opened in a tab; distinguishes duplicate tabs. */
+  instanceId?: string;
+
   hasKey?: boolean;
   hasKeyPassword?: boolean;
+  // Set by formatHostOutput() alongside hasKey/hasKeyPassword so the UI can
+  // tell a stored secret from an empty one without receiving it.
+  hasPassword?: boolean;
+  hasSudoPassword?: boolean;
+  hasRdpPassword?: boolean;
+  hasVncPassword?: boolean;
+  hasTelnetPassword?: boolean;
 
   isShared?: boolean;
-  permissionLevel?: "view";
+  authOverrides?: HostAuthOverrides;
+  permissionLevel?: "connect" | "view" | "edit" | "manage";
   sharedExpiresAt?: string;
-}
+  ownerUsername?: string;
+};
 
 export interface JumpHostData {
   hostId: number;
@@ -216,7 +271,13 @@ export interface QuickActionData {
 export interface ProxyNode {
   host: string;
   port: number;
-  type: 4 | 5 | "http";
+  /**
+   * The host editor writes "socks4"/"socks5"/"http", while proxy-helper.ts
+   * tests for "http" and casts everything else to 4|5 before handing it to the
+   * socks client. The two spellings have never agreed; typed as the union of
+   * what is actually stored rather than pretending one side is right.
+   */
+  type: 4 | 5 | "http" | "socks4" | "socks5";
   username?: string;
   password?: string;
 }
@@ -227,6 +288,8 @@ export interface HostData {
   port: number;
   username: string;
   folder?: string;
+  /** Sub-host nesting: mutually exclusive with folder. */
+  parentHostId?: number | string | null;
   tags?: string[];
   pin?: boolean;
   authType:
@@ -236,14 +299,18 @@ export interface HostData {
     | "none"
     | "opkssh"
     | "tailscale"
-    | "agent";
+    | "agent"
+    | "vault";
   useWarpgate?: boolean;
+  shareSshAuth?: boolean;
   password?: string;
-  key?: File | null;
+  key?: File | string | null;
   keyPassword?: string;
   keyType?: string;
   sudoPassword?: string;
   credentialId?: number | null;
+  vaultProfileId?: number | null;
+  connectionOrigin?: "local" | "remote" | null;
   overrideCredentialUsername?: boolean;
   enableTerminal?: boolean;
   enableSessionLogging?: boolean;
@@ -254,7 +321,11 @@ export interface HostData {
   enableDocker?: boolean;
   enableProxmox?: boolean;
   enableTmuxMonitor?: boolean;
+  enableTerminalToolbar?: boolean;
+  allowSessionSharing?: boolean;
   proxmoxConfig?: ProxmoxConfig | Record<string, unknown> | null;
+  enableProxmoxStats?: boolean;
+  proxmoxStatsConfig?: ProxmoxStatsConfig | Record<string, unknown> | null;
   showTerminalInSidebar?: boolean;
   showFileManagerInSidebar?: boolean;
   showTunnelInSidebar?: boolean;
@@ -265,8 +336,8 @@ export interface HostData {
   tunnelConnections?: TunnelConnection[];
   jumpHosts?: JumpHostData[];
   quickActions?: QuickActionData[];
-  statsConfig?: string | Record<string, unknown>;
-  terminalConfig?: TerminalConfig;
+  statsConfig?: string | StatsConfig;
+  terminalConfig?: Partial<TerminalConfig>;
   notes?: string;
 
   useSocks5?: boolean;
@@ -288,7 +359,7 @@ export interface HostData {
   domain?: string;
   security?: string;
   ignoreCert?: boolean;
-  guacamoleConfig?: Record<string, unknown> | null;
+  guacamoleConfig?: GuacamoleConfig | null;
   dockerConfig?: Record<string, unknown> | null;
 
   enableSsh?: boolean;
@@ -311,7 +382,7 @@ export interface HostData {
   telnetUser?: string;
   telnetPassword?: string;
   telnetCredentialId?: number | null;
-  rdpAuthType?: "direct" | "credential" | null;
+  rdpAuthType?: "direct" | "credential" | "none" | null;
   vncAuthType?: "direct" | "credential" | null;
   telnetAuthType?: "direct" | "credential" | null;
 }
@@ -325,6 +396,8 @@ export interface SSHFolder {
   name: string;
   color?: string;
   icon?: string;
+  credentialId?: number | null;
+  sortOrder?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -599,6 +672,7 @@ export interface TermixAlert {
 // ============================================================================
 
 export interface TerminalConfig {
+  localEcho?: "default" | "off" | "auto" | "on";
   cursorBlink: boolean;
   cursorStyle: "block" | "underline" | "bar";
   fontSize: number;
@@ -610,6 +684,7 @@ export interface TerminalConfig {
   scrollback: number;
   bellStyle: "none" | "sound" | "visual" | "both";
   rightClickSelectsWord: boolean;
+  macOptionIsMeta: boolean;
   fastScrollModifier: "alt" | "ctrl" | "shift";
   fastScrollSensitivity: number;
   minimumContrastRatio: number;
@@ -621,6 +696,7 @@ export interface TerminalConfig {
   autoMosh: boolean;
   moshCommand: string;
   sudoPasswordAutoFill: boolean;
+  sudoPassword?: string | null;
   keepaliveInterval?: number;
   keepaliveCountMax?: number;
   autoTmux: boolean;
@@ -639,12 +715,14 @@ export interface TerminalConfig {
   linkClickBehavior?: "confirm" | "direct";
   useSSHTitle?: boolean;
   agentSocketPath?: string;
+  agentIdentity?: string;
   customThemeColors?: {
     background: string;
     foreground: string;
-    cursor: string;
-    cursorAccent: string;
-    selectionBackground: string;
+    cursor?: string;
+    cursorAccent?: string;
+    selectionBackground?: string;
+    selectionForeground?: string;
     black: string;
     red: string;
     green: string;
@@ -680,6 +758,7 @@ export interface TabContextTab {
     | "file_manager"
     | "user_profile"
     | "docker"
+    | "tunnel"
     | "network_graph"
     | "tmux_monitor" // --- tmux-monitor ---
     | "rdp"
@@ -699,6 +778,7 @@ export interface TerminalRefHandle {
   isConnected?: () => boolean;
   fit?: () => void;
   sendInput?: (data: string) => void;
+  subscribeOutput?: (listener: (data: string) => void) => () => void;
   notifyResize?: () => void;
   refresh?: () => void;
   openFileManager?: () => void;
@@ -750,12 +830,7 @@ export type ErrorType =
 // ============================================================================
 
 export type AuthType =
-  | "password"
-  | "key"
-  | "credential"
-  | "none"
-  | "opkssh"
-  | "tailscale";
+  "password" | "key" | "credential" | "none" | "opkssh" | "tailscale";
 
 export type KeyType = "rsa" | "ecdsa" | "ed25519";
 
@@ -884,39 +959,8 @@ export interface FolderStats {
   }>;
 }
 
-// ============================================================================
-// SNIPPETS TYPES
-// ============================================================================
-
-export interface Snippet {
-  id: number;
-  userId: string;
-  name: string;
-  content: string;
-  description?: string;
-  folder?: string;
-  order?: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface SnippetData {
-  name: string;
-  content: string;
-  description?: string;
-  folder?: string;
-  order?: number;
-}
-
-export interface SnippetFolder {
-  id: number;
-  userId: string;
-  name: string;
-  color?: string;
-  icon?: string;
-  createdAt: string;
-  updatedAt: string;
-}
+// Snippet, SnippetFolder types live in ui-types.ts (the shape actually used
+// by SnippetsPanel.tsx); this file's older definitions were unused and removed.
 
 // ============================================================================
 // BACKEND TYPES
@@ -952,6 +996,8 @@ export type PartialExcept<T, K extends keyof T> = Partial<T> & Pick<T, K>;
 export interface AuthenticatedRequest extends Request {
   userId: string;
   sessionId?: string;
+  apiKeyId?: string;
+  actingAdminUserId?: string;
   user?: {
     id: string;
     username: string;

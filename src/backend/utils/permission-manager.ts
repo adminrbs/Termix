@@ -1,13 +1,10 @@
 import type { Request, Response, NextFunction } from "express";
-import { db } from "../database/db/index.js";
 import {
-  hostAccess,
-  roles,
-  userRoles,
-  hosts,
-  users,
-} from "../database/db/schema.js";
-import { eq, and, or, isNull, gte, sql } from "drizzle-orm";
+  createCurrentRbacAccessRepository,
+  createCurrentRoleRepository,
+  createCurrentUserRepository,
+  createCurrentHostResolutionRepository,
+} from "../database/repositories/factory.js";
 import { databaseLogger } from "./logger.js";
 
 interface AuthenticatedRequest extends Request {
@@ -15,11 +12,33 @@ interface AuthenticatedRequest extends Request {
   dataKey?: Buffer;
 }
 
+const SHARE_PERMISSION_LEVELS = ["connect", "view", "edit", "manage"] as const;
+
+type SharePermissionLevel = (typeof SHARE_PERMISSION_LEVELS)[number];
+
+export type HostAction = SharePermissionLevel | "delete";
+
+const LEVEL_RANK: Record<SharePermissionLevel, number> = {
+  connect: 1,
+  view: 2,
+  edit: 3,
+  manage: 4,
+};
+
+function normalizeSharePermissionLevel(
+  level: string | null | undefined,
+): SharePermissionLevel {
+  return SHARE_PERMISSION_LEVELS.includes(level as SharePermissionLevel)
+    ? (level as SharePermissionLevel)
+    : "connect";
+}
+
 interface HostAccessInfo {
   hasAccess: boolean;
   isOwner: boolean;
   isShared: boolean;
-  permissionLevel?: "view";
+  isAdminBypass?: boolean;
+  permissionLevel?: SharePermissionLevel;
   expiresAt?: string | null;
 }
 
@@ -51,8 +70,12 @@ class PermissionManager {
       });
     }, 60 * 1000);
 
+    // Entries expire on read against their own timestamp, so this sweep only
+    // has to drop ones nobody has come back for. Flushing the whole map on a
+    // timer instead expired every active user at the same instant, so each
+    // sweep was followed by a burst of simultaneous role lookups.
     setInterval(() => {
-      this.clearPermissionCache();
+      this.evictExpiredPermissions();
     }, this.CACHE_TTL);
   }
 
@@ -65,15 +88,7 @@ class PermissionManager {
 
   private async cleanupExpiredAccess(): Promise<void> {
     try {
-      const now = new Date().toISOString();
-      await db
-        .delete(hostAccess)
-        .where(
-          and(
-            sql`${hostAccess.expiresAt} IS NOT NULL`,
-            sql`${hostAccess.expiresAt} <= ${now}`,
-          ),
-        );
+      await createCurrentRbacAccessRepository().deleteExpiredHostAccess();
     } catch (error) {
       databaseLogger.error("Failed to cleanup expired host access", error, {
         operation: "host_access_cleanup_failed",
@@ -81,8 +96,13 @@ class PermissionManager {
     }
   }
 
-  private clearPermissionCache(): void {
-    this.permissionCache.clear();
+  private evictExpiredPermissions(): void {
+    const now = Date.now();
+    for (const [userId, entry] of this.permissionCache) {
+      if (now - entry.timestamp >= this.CACHE_TTL) {
+        this.permissionCache.delete(userId);
+      }
+    }
   }
 
   invalidateUserPermissionCache(userId: string): void {
@@ -96,20 +116,27 @@ class PermissionManager {
     }
 
     try {
-      const userRoleRecords = await db
-        .select({
-          permissions: roles.permissions,
-        })
-        .from(userRoles)
-        .innerJoin(roles, eq(userRoles.roleId, roles.id))
-        .where(eq(userRoles.userId, userId));
+      const userRoleRecords =
+        await createCurrentRoleRepository().listUserRolePermissions(userId);
 
       const allPermissions = new Set<string>();
       for (const record of userRoleRecords) {
+        // A role can legitimately have no permissions column yet, and
+        // JSON.parse(null) returns null rather than throwing, which used to
+        // blow up the loop and leave the user with no permissions at all.
+        if (!record.permissions) continue;
+
         try {
-          const permissions = JSON.parse(record.permissions) as string[];
-          for (const perm of permissions) {
-            allPermissions.add(perm);
+          const parsed = JSON.parse(record.permissions) as unknown;
+          if (!Array.isArray(parsed)) {
+            databaseLogger.warn("Role permissions are not a list", {
+              operation: "get_user_permissions",
+              userId,
+            });
+            continue;
+          }
+          for (const perm of parsed) {
+            if (typeof perm === "string") allPermissions.add(perm);
           }
         } catch (parseError) {
           databaseLogger.warn("Failed to parse role permissions", {
@@ -162,16 +189,12 @@ class PermissionManager {
   async canAccessHost(
     userId: string,
     hostId: number,
-    action: "read" | "write" | "execute" | "delete" | "share" = "read",
+    action: HostAction = "connect",
   ): Promise<HostAccessInfo> {
     try {
-      const host = await db
-        .select()
-        .from(hosts)
-        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
-        .limit(1);
+      const hostResolutionRepository = createCurrentHostResolutionRepository();
 
-      if (host.length > 0) {
+      if (await hostResolutionRepository.isHostOwnedByUser(hostId, userId)) {
         return {
           hasAccess: true,
           isOwner: true,
@@ -179,43 +202,20 @@ class PermissionManager {
         };
       }
 
-      const userRoleIds = await db
-        .select({ roleId: userRoles.roleId })
-        .from(userRoles)
-        .where(eq(userRoles.userId, userId));
-      const roleIds = userRoleIds.map((r) => r.roleId);
+      const roleIds =
+        await createCurrentRoleRepository().listUserRoleIds(userId);
 
-      const now = new Date().toISOString();
-      const sharedAccess = await db
-        .select()
-        .from(hostAccess)
-        .where(
-          and(
-            eq(hostAccess.hostId, hostId),
-            or(
-              eq(hostAccess.userId, userId),
-              roleIds.length > 0
-                ? sql`${hostAccess.roleId} IN (${sql.join(
-                    roleIds.map((id) => sql`${id}`),
-                    sql`, `,
-                  )})`
-                : sql`false`,
-            ),
-            or(isNull(hostAccess.expiresAt), gte(hostAccess.expiresAt, now)),
-          ),
-        )
-        .limit(1);
+      const access =
+        await createCurrentRbacAccessRepository().findActiveHostAccess(
+          hostId,
+          userId,
+          roleIds,
+        );
 
-      if (sharedAccess.length > 0) {
-        const access = sharedAccess[0];
+      if (access) {
+        const ownerId = await hostResolutionRepository.findHostOwnerId(hostId);
 
-        const hostOwnerCheck = await db
-          .select({ ownerId: hosts.userId })
-          .from(hosts)
-          .where(eq(hosts.id, hostId))
-          .limit(1);
-
-        if (hostOwnerCheck.length > 0 && hostOwnerCheck[0].ownerId === userId) {
+        if (ownerId === userId) {
           return {
             hasAccess: true,
             isOwner: true,
@@ -223,37 +223,50 @@ class PermissionManager {
           };
         }
 
-        if (action === "write" || action === "delete") {
+        const grantedLevel = normalizeSharePermissionLevel(
+          access.permissionLevel,
+        );
+
+        if (
+          action === "delete" ||
+          LEVEL_RANK[grantedLevel] < LEVEL_RANK[action]
+        ) {
+          if (await this.isAdmin(userId)) {
+            return this.adminBypassAccess();
+          }
           return {
             hasAccess: false,
             isOwner: false,
             isShared: true,
-            permissionLevel: access.permissionLevel as "view",
+            permissionLevel: grantedLevel,
             expiresAt: access.expiresAt,
           };
         }
 
-        try {
-          await db
-            .update(hostAccess)
-            .set({
-              lastAccessedAt: now,
-            })
-            .where(eq(hostAccess.id, access.id));
-        } catch (error) {
-          databaseLogger.warn("Failed to update host access timestamp", {
-            operation: "update_host_access_timestamp",
-            error,
-          });
+        if (action === "connect") {
+          try {
+            await createCurrentRbacAccessRepository().touchHostAccess(
+              access.id,
+            );
+          } catch (error) {
+            databaseLogger.warn("Failed to update host access timestamp", {
+              operation: "update_host_access_timestamp",
+              error,
+            });
+          }
         }
 
         return {
           hasAccess: true,
           isOwner: false,
           isShared: true,
-          permissionLevel: access.permissionLevel as "view",
+          permissionLevel: grantedLevel,
           expiresAt: access.expiresAt,
         };
+      }
+
+      if (await this.isAdmin(userId)) {
+        return this.adminBypassAccess();
       }
 
       return {
@@ -276,30 +289,79 @@ class PermissionManager {
     }
   }
 
+  /**
+   * The subset of `hostIds` this user may reach, resolved in a fixed number of
+   * queries instead of one call per host.
+   *
+   * canAccessHost costs between one and four queries, so filtering a list with
+   * it is linear in host count — and the status poll does exactly that every
+   * few seconds for the whole fleet. This answers the same question for many
+   * hosts at once using the same three rules, in the same order: owner, then
+   * an unexpired grant, then admin bypass.
+   *
+   * Deliberately limited to read-style checks. It does not touch grant
+   * timestamps the way `canAccessHost(..., "connect")` does, because this is
+   * used for visibility filtering rather than for opening a connection.
+   */
+  async filterAccessibleHostIds(
+    userId: string,
+    hostIds: number[],
+  ): Promise<Set<number>> {
+    if (hostIds.length === 0) return new Set();
+
+    try {
+      if (await this.isAdmin(userId)) {
+        return new Set(hostIds);
+      }
+
+      const owned =
+        await createCurrentHostResolutionRepository().listOwnedHostIds(userId);
+
+      const roleIds =
+        await createCurrentRoleRepository().listUserRoleIds(userId);
+      const grants =
+        await createCurrentRbacAccessRepository().listVisibleHostAccessEntries(
+          userId,
+          roleIds,
+        );
+      const granted = new Set(grants.map((grant) => grant.hostId));
+
+      return new Set(hostIds.filter((id) => owned.has(id) || granted.has(id)));
+    } catch (error) {
+      databaseLogger.error("Failed to filter accessible hosts", error, {
+        operation: "filter_accessible_hosts",
+        userId,
+      });
+      // Fail closed: showing nothing is safer than showing another
+      // tenant's hosts.
+      return new Set();
+    }
+  }
+
+  // Admins get owner-equivalent access to every host; each connect is
+  // audit-logged in the host resolver.
+  private adminBypassAccess(): HostAccessInfo {
+    return {
+      hasAccess: true,
+      isOwner: false,
+      isShared: false,
+      isAdminBypass: true,
+      permissionLevel: "manage",
+    };
+  }
+
   async isAdmin(userId: string): Promise<boolean> {
     try {
-      const user = await db
-        .select({ isAdmin: users.isAdmin })
-        .from(users)
-        .where(eq(users.id, userId))
-        .limit(1);
+      const user = await createCurrentUserRepository().findById(userId);
 
-      if (user.length > 0 && user[0].isAdmin) {
+      if (user?.isAdmin) {
         return true;
       }
 
-      const adminRoles = await db
-        .select({ roleName: roles.name })
-        .from(userRoles)
-        .innerJoin(roles, eq(userRoles.roleId, roles.id))
-        .where(
-          and(
-            eq(userRoles.userId, userId),
-            or(eq(roles.name, "admin"), eq(roles.name, "super_admin")),
-          ),
-        );
-
-      return adminRoles.length > 0;
+      return createCurrentRoleRepository().userHasAnyRoleName(userId, [
+        "admin",
+        "super_admin",
+      ]);
     } catch (error) {
       databaseLogger.error("Failed to check admin status", error, {
         operation: "is_admin",
@@ -343,7 +405,7 @@ class PermissionManager {
 
   requireHostAccess(
     hostIdParam: string = "id",
-    action: "read" | "write" | "execute" | "delete" | "share" = "read",
+    action: HostAction = "connect",
   ) {
     return async (
       req: AuthenticatedRequest,
@@ -418,5 +480,10 @@ class PermissionManager {
   }
 }
 
-export { PermissionManager };
-export type { AuthenticatedRequest, HostAccessInfo, PermissionCheckResult };
+export { PermissionManager, SHARE_PERMISSION_LEVELS, LEVEL_RANK };
+export type {
+  AuthenticatedRequest,
+  HostAccessInfo,
+  PermissionCheckResult,
+  SharePermissionLevel,
+};

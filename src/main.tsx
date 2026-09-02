@@ -10,9 +10,12 @@ import { Toaster } from "@/components/sonner";
 import { Auth, getStoredAuth, clearStoredAuth } from "@/auth/Auth";
 import { getUserInfo, getCurrentToken, appReadyPromise } from "@/main-axios";
 import { applyAccentColor, applyFontSize } from "@/lib/theme";
+import { installElectronWheelZoomGuard } from "@/lib/electron-wheel-zoom";
 import type { FontSizeId } from "@/types/ui-types";
 import { useServiceWorker } from "@/hooks/use-service-worker";
 import { useTranslation } from "react-i18next";
+import { UiPreferencesProvider } from "@/contexts/UiPreferencesContext";
+import { ConnectionDefaultsProvider } from "@/contexts/ConnectionDefaultsContext";
 
 const AppShell = lazy(() =>
   import("@/AppShell").then((m) => ({ default: m.AppShell })),
@@ -34,6 +37,11 @@ const TunnelApp = lazy(() =>
 );
 const HostMetricsApp = lazy(() =>
   import("@/features/host-metrics/HostMetricsApp").then((m) => ({
+    default: m.default,
+  })),
+);
+const ProxmoxStatsApp = lazy(() =>
+  import("@/features/proxmox-stats/ProxmoxStatsApp").then((m) => ({
     default: m.default,
   })),
 );
@@ -64,12 +72,14 @@ const ElectronVersionCheck = lazy(() =>
   })),
 );
 
+// Anonymous guest view for shared terminal/RDP/VNC/Telnet sessions (?view=shared&token=<linkToken>).
+// Rendered outside FullscreenAppGate since guests never have a JWT/cookie to verify.
+const SharedSessionView = lazy(
+  () => import("@/features/session-sharing/SharedSessionView"),
+);
+
 type Phase =
-  | "verifying"
-  | "idle-auth"
-  | "fading-in"
-  | "idle-app"
-  | "fading-out";
+  "verifying" | "idle-auth" | "fading-in" | "idle-app" | "fading-out";
 
 function FullscreenApp() {
   const searchParams = new URLSearchParams(window.location.search);
@@ -98,6 +108,8 @@ function FullscreenApp() {
     case "host-metrics":
     case "server-stats":
       return <HostMetricsApp hostId={hostId || undefined} />;
+    case "proxmox-stats":
+      return <ProxmoxStatsApp hostId={hostId || undefined} />;
     case "docker":
       return <DockerApp hostId={hostId || undefined} />;
     case "rdp":
@@ -173,11 +185,15 @@ function App() {
     stored?.loggedIn ? "verifying" : "idle-auth",
   );
   const [authUsername, setAuthUsername] = useState(stored?.username ?? "");
+  const [verifyRetryCount, setVerifyRetryCount] = useState(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Track whether fading-in came from a fresh login (vs. session verification on page load).
   // When session-verified, Auth must not mount during the transition — it would trigger
   // silent OIDC redirect and cause an infinite refresh loop.
   const fadingInFromLoginRef = useRef(false);
+  // Dedupes concurrent handleLogout() calls within the same tick -- see
+  // handleLogout for why phase state alone isn't sufficient for this.
+  const loggingOutRef = useRef(false);
 
   useEffect(() => {
     const savedAccent = localStorage.getItem("termix-accent");
@@ -185,7 +201,7 @@ function App() {
     const savedSize = localStorage.getItem(
       "termix-font-size",
     ) as FontSizeId | null;
-    applyFontSize(savedSize ?? "lg");
+    applyFontSize(savedSize ?? "md");
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
@@ -203,7 +219,18 @@ function App() {
         if (isElectron()) {
           try {
             const token = await getCurrentToken();
-            if (token) localStorage.setItem("jwt", token);
+            if (token) {
+              localStorage.setItem("jwt", token);
+              // Remote Sync's engine (main process) needs this local JWT to
+              // authenticate against the embedded backend during sync, same
+              // as a fresh login provides via handleLogin below -- a session
+              // restore (the common case on every normal launch) must hand
+              // it over too, or sync silently never runs after the first
+              // app restart.
+              window.electronAPI
+                ?.invoke?.("notify-local-login", token)
+                .catch(() => {});
+            }
           } catch {
             // Non-fatal: WebSocket connections will fall back to cookie auth
           }
@@ -212,34 +239,81 @@ function App() {
         setPhase("fading-in");
         timerRef.current = setTimeout(() => setPhase("idle-app"), 450);
       })
-      .catch(() => {
-        clearStoredAuth();
-        setPhase("idle-auth");
+      .catch((err: unknown) => {
+        // Only treat a genuine auth rejection (401/403) as "not logged in".
+        // Anything else (network hiccup, backend still starting up, a
+        // transient 5xx) is not proof the session is invalid -- clearing
+        // stored auth here would drop the user back to Auth.tsx, which in
+        // Electron immediately mints a brand-new auto-session, silently
+        // swapping out the JWT/cookie from under any still-in-flight
+        // requests and causing spurious "Session expired" toasts.
+        const status =
+          (err as { status?: number; response?: { status?: number } })
+            ?.status ??
+          (err as { response?: { status?: number } })?.response?.status;
+        if (status === 401 || status === 403) {
+          clearStoredAuth();
+          setPhase("idle-auth");
+          return;
+        }
+        // Transient failure: retry rather than logging out. In Electron the
+        // embedded local backend is bundled, always-on infrastructure that
+        // always eventually comes up (a slow cold boot just takes longer),
+        // and Auth.tsx never shows a login form for it anyway -- so there's
+        // no reason to ever give up and manufacture a logout here. Outside
+        // Electron a genuinely broken backend still needs to surface the
+        // login screen eventually, so that case keeps a retry cap.
+        if (!isElectron() && verifyRetryCount >= 5) {
+          clearStoredAuth();
+          setPhase("idle-auth");
+          return;
+        }
+        const delay = isElectron()
+          ? Math.min(1000 * 2 ** verifyRetryCount, 10000)
+          : 3000;
+        timerRef.current = setTimeout(() => {
+          setVerifyRetryCount((c) => c + 1);
+        }, delay);
       });
-  }, [phase]);
+  }, [phase, verifyRetryCount]);
 
   function handleLogin(u: string) {
+    loggingOutRef.current = false;
     setAuthUsername(u);
     fadingInFromLoginRef.current = true;
     setPhase("fading-in");
     timerRef.current = setTimeout(() => setPhase("idle-app"), 450);
     if (isElectron()) {
       window.electronAPI?.startC2SAutoStartTunnels?.().catch(() => {});
+      const localJwt = localStorage.getItem("jwt");
+      if (localJwt) {
+        window.electronAPI
+          ?.invoke?.("notify-local-login", localJwt)
+          .catch(() => {});
+      }
     }
   }
 
   function handleLogout() {
+    // A single background hiccup can trigger several independent 401s at
+    // once (e.g. a burst of unrelated polls all failing together in the
+    // same tick), each calling this. React batches the resulting setPhase
+    // calls, so checking `phase` here can't distinguish the first call in
+    // a batch from the second -- both would see the same pre-update value
+    // and both would proceed, each overwriting timerRef with a fresh
+    // 450ms timer. A steady trickle of these could keep resetting the
+    // countdown so the transition never actually completes, which looks
+    // exactly like "nothing happens." loggingOutRef is synchronous and
+    // isn't subject to batching, so it correctly dedupes within one tick.
+    if (loggingOutRef.current) return;
+    loggingOutRef.current = true;
     clearStoredAuth();
     setPhase("fading-out");
     timerRef.current = setTimeout(() => {
       setAuthUsername("");
       setPhase("idle-auth");
+      loggingOutRef.current = false;
     }, 450);
-  }
-
-  function handleChangeServer() {
-    localStorage.setItem("termix_show_server_config", "true");
-    handleLogout();
   }
 
   const showApp =
@@ -287,11 +361,11 @@ function App() {
           }}
         >
           <Suspense fallback={null}>
-            <AppShell
-              username={authUsername}
-              onLogout={handleLogout}
-              onChangeServer={handleChangeServer}
-            />
+            <UiPreferencesProvider>
+              <ConnectionDefaultsProvider>
+                <AppShell username={authUsername} onLogout={handleLogout} />
+              </ConnectionDefaultsProvider>
+            </UiPreferencesProvider>
           </Suspense>
         </div>
       )}
@@ -321,10 +395,24 @@ function RootApp() {
   const searchParams = new URLSearchParams(window.location.search);
   const isFullscreen = searchParams.has("view");
 
+  // Anonymous guests have no cookie/JWT at all, so this bypasses FullscreenAppGate's
+  // auth check entirely rather than waiting on a getUserInfo() call that would always fail.
+  if (searchParams.get("view") === "shared") {
+    return (
+      <Suspense fallback={null}>
+        <SharedSessionView />
+      </Suspense>
+    );
+  }
+
   if (isFullscreen) {
     return (
       <Suspense fallback={null}>
-        <FullscreenAppGate />
+        <UiPreferencesProvider>
+          <ConnectionDefaultsProvider>
+            <FullscreenAppGate />
+          </ConnectionDefaultsProvider>
+        </UiPreferencesProvider>
       </Suspense>
     );
   }
@@ -339,6 +427,8 @@ function RootApp() {
 
   return <App />;
 }
+
+installElectronWheelZoomGuard();
 
 prepareClientCacheVersion().finally(() => {
   createRoot(document.getElementById("root")!).render(

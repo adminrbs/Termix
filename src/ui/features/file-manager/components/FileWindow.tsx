@@ -11,6 +11,7 @@ import {
   connectSSH,
 } from "@/main-axios.ts";
 import { toast } from "sonner";
+import type { SSHHost } from "@/types/index";
 import { useTranslation } from "react-i18next";
 
 interface FileItem {
@@ -22,20 +23,6 @@ interface FileItem {
   permissions?: string;
   owner?: string;
   group?: string;
-}
-
-interface SSHHost {
-  id: number;
-  name: string;
-  ip: string;
-  port: number;
-  username: string;
-  password?: string;
-  key?: string;
-  keyPassword?: string;
-  authType: "password" | "key";
-  credentialId?: number;
-  userId?: number;
 }
 
 interface FileWindowProps {
@@ -81,6 +68,7 @@ export function FileWindow({
 
   const [content, setContent] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [isEditable, setIsEditable] = useState(false);
   const [pendingContent, setPendingContent] = useState<string>("");
   const [resetKey, setResetKey] = useState(0);
@@ -283,7 +271,9 @@ export function FileWindow({
 
         await ensureSSHConnection();
 
-        const response = await readSSHFile(sshSessionId, file.path);
+        const response = await readSSHFile(sshSessionId, file.path, {
+          force: true,
+        });
         const fileContent = response.content || "";
         setContent(fileContent);
         setPendingContent("");
@@ -309,7 +299,7 @@ export function FileWindow({
 
   const handleSave = async (newContent: string) => {
     try {
-      setIsLoading(true);
+      setIsSaving(true);
 
       await ensureSSHConnection();
 
@@ -340,7 +330,7 @@ export function FileWindow({
         );
       }
     } finally {
-      setIsLoading(false);
+      setIsSaving(false);
     }
   };
 
@@ -553,6 +543,7 @@ export function FileWindow({
         content={pendingContent || content}
         savedContent={content}
         isLoading={isLoading}
+        isSaving={isSaving}
         resetKey={resetKey}
         onRevert={handleRevert}
         isEditable={isEditable}

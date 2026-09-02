@@ -1,20 +1,27 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Router } from "express";
-import { and, eq, ne } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import QRCode from "qrcode";
 import speakeasy from "speakeasy";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
 import { FieldCrypto } from "../../utils/field-crypto.js";
 import { LazyFieldEncryption } from "../../utils/lazy-field-encryption.js";
 import { authLogger } from "../../utils/logger.js";
 import { loginRateLimiter } from "../../utils/login-rate-limiter.js";
+import { isTrustedProxyAuthEnabled } from "../../utils/trusted-proxy-auth.js";
 import {
   generateDeviceFingerprint,
+  getDeviceId,
   parseUserAgent,
 } from "../../utils/user-agent-parser.js";
-import { db } from "../db/index.js";
-import { sessions, trustedDevices, users } from "../db/schema.js";
+import {
+  createCurrentSessionRepository,
+  createCurrentSettingsRepository,
+  createCurrentTrustedDeviceRepository,
+  createCurrentUserRepository,
+} from "../repositories/factory.js";
+import type { UserRecord } from "../repositories/user-repository.js";
 
 type NativeAppRequestChecker = (req: Request) => boolean;
 
@@ -24,23 +31,11 @@ interface UserTotpRoutesDeps {
   isNativeAppRequest: NativeAppRequestChecker;
 }
 
-type TotpUserRecord = typeof users.$inferSelect;
-
 export async function verifyTotpReauth(
-  userRecord: TotpUserRecord,
+  userRecord: UserRecord,
   credential: string,
   userDataKey?: Buffer | null,
 ): Promise<boolean> {
-  if (!userRecord.isOidc && userRecord.passwordHash) {
-    const passwordMatch = await bcrypt.compare(
-      credential,
-      userRecord.passwordHash,
-    );
-    if (passwordMatch) {
-      return true;
-    }
-  }
-
   if (userRecord.totpSecret) {
     const totpSecret = userDataKey
       ? LazyFieldEncryption.safeGetFieldValue(
@@ -93,10 +88,9 @@ export async function verifyTotpReauth(
             "totpBackupCodes",
           )
         : updatedJson;
-      await db
-        .update(users)
-        .set({ totpBackupCodes: storedValue })
-        .where(eq(users.id, userRecord.id));
+      await createCurrentUserRepository().update(userRecord.id, {
+        totpBackupCodes: storedValue,
+      });
       return true;
     }
   }
@@ -130,12 +124,10 @@ export function registerUserTotpRoutes(
     const userId = (req as AuthenticatedRequest).userId;
 
     try {
-      const user = await db.select().from(users).where(eq(users.id, userId));
-      if (!user || user.length === 0) {
+      const userRecord = await createCurrentUserRepository().findById(userId);
+      if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
-
-      const userRecord = user[0];
 
       if (userRecord.totpEnabled) {
         return res.status(400).json({ error: "TOTP is already enabled" });
@@ -146,10 +138,9 @@ export function registerUserTotpRoutes(
         length: 32,
       });
 
-      await db
-        .update(users)
-        .set({ totpSecret: secret.base32 })
-        .where(eq(users.id, userId));
+      await createCurrentUserRepository().update(userId, {
+        totpSecret: secret.base32,
+      });
 
       const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url || "");
 
@@ -193,6 +184,11 @@ export function registerUserTotpRoutes(
    *         description: Failed to enable TOTP.
    */
   router.post("/totp/enable", authenticateJWT, async (req, res) => {
+    if (isTrustedProxyAuthEnabled()) {
+      return res.status(409).json({
+        error: "TOTP is disabled while trusted proxy authentication is enabled",
+      });
+    }
     const userId = (req as AuthenticatedRequest).userId;
     const sessionId = (req as AuthenticatedRequest).sessionId;
     const { totp_code } = req.body;
@@ -202,14 +198,11 @@ export function registerUserTotpRoutes(
     }
 
     try {
-      const passwordLoginRow = db.$client
-        .prepare(
-          "SELECT value FROM settings WHERE key = 'allow_password_login'",
-        )
-        .get() as { value: string } | undefined;
-      const passwordLoginAllowed = passwordLoginRow
-        ? passwordLoginRow.value === "true"
-        : true;
+      const passwordLoginAllowed =
+        await createCurrentSettingsRepository().getBoolean(
+          "allow_password_login",
+          true,
+        );
       if (!passwordLoginAllowed) {
         return res.status(409).json({
           error:
@@ -217,12 +210,10 @@ export function registerUserTotpRoutes(
         });
       }
 
-      const user = await db.select().from(users).where(eq(users.id, userId));
-      if (!user || user.length === 0) {
+      const userRecord = await createCurrentUserRepository().findById(userId);
+      if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
-
-      const userRecord = user[0];
 
       if (userRecord.totpEnabled) {
         return res.status(400).json({ error: "TOTP is already enabled" });
@@ -267,26 +258,19 @@ export function registerUserTotpRoutes(
           )
         : backupCodesJson;
 
-      await db
-        .update(users)
-        .set({
-          totpEnabled: true,
-          totpBackupCodes: storedBackupCodes,
-        })
-        .where(eq(users.id, userId));
+      await createCurrentUserRepository().update(userId, {
+        totpEnabled: true,
+        totpBackupCodes: storedBackupCodes,
+      });
 
-      await db
-        .delete(sessions)
-        .where(
-          sessionId
-            ? and(eq(sessions.userId, userId), ne(sessions.id, sessionId))
-            : eq(sessions.userId, userId),
-        );
-      await db.delete(trustedDevices).where(eq(trustedDevices.userId, userId));
+      await createCurrentSessionRepository().revokeAllForUser(
+        userId,
+        sessionId,
+      );
+      await createCurrentTrustedDeviceRepository().deleteByUserId(userId);
 
       try {
-        const { saveMemoryDatabaseToFile } = await import("../db/index.js");
-        await saveMemoryDatabaseToFile();
+        await DatabaseSaveTrigger.forceSave("totp_enable_explicit_save");
       } catch (saveError) {
         authLogger.error(
           "Failed to persist TOTP enablement to disk",
@@ -342,46 +326,52 @@ export function registerUserTotpRoutes(
   router.post("/totp/disable", authenticateJWT, async (req, res) => {
     const userId = (req as AuthenticatedRequest).userId;
     const { password, totp_code } = req.body;
-    const credential = password || totp_code;
-
-    if (!credential) {
-      return res
-        .status(400)
-        .json({ error: "A TOTP code or password is required" });
-    }
-
     try {
-      const user = await db.select().from(users).where(eq(users.id, userId));
-      if (!user || user.length === 0) {
+      const userRecord = await createCurrentUserRepository().findById(userId);
+      if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
 
-      const userRecord = user[0];
+      // One re-authentication value, whichever kind it is. The dialog offers a
+      // single field -- "Enter TOTP code or password" -- so it arrives in
+      // whichever of the two body fields the caller happened to use.
+      const credential = totp_code || password;
+      if (!credential) {
+        return res.status(400).json({
+          error: userRecord.isOidc
+            ? "A TOTP code is required"
+            : "A TOTP code or password is required",
+        });
+      }
 
       if (!userRecord.totpEnabled) {
         return res.status(400).json({ error: "TOTP is not enabled" });
       }
 
       const userDataKey = authManager.getUserDataKey(userId);
-      const verified = await verifyTotpReauth(
+      // TOTP code or backup code first; verifyTotpReauth deliberately refuses
+      // the account password, so that stays a separate comparison here.
+      let verified = await verifyTotpReauth(
         userRecord,
         credential,
         userDataKey,
       );
+
+      if (!verified && !userRecord.isOidc && userRecord.passwordHash) {
+        verified = await bcrypt.compare(credential, userRecord.passwordHash);
+      }
+
       if (!verified) {
         return res
           .status(401)
           .json({ error: "Incorrect password or invalid TOTP code" });
       }
 
-      await db
-        .update(users)
-        .set({
-          totpEnabled: false,
-          totpSecret: null,
-          totpBackupCodes: null,
-        })
-        .where(eq(users.id, userId));
+      await createCurrentUserRepository().update(userId, {
+        totpEnabled: false,
+        totpSecret: null,
+        totpBackupCodes: null,
+      });
       authLogger.info("Two-factor authentication disabled", {
         operation: "totp_disable",
         userId,
@@ -428,21 +418,27 @@ export function registerUserTotpRoutes(
   router.post("/totp/backup-codes", authenticateJWT, async (req, res) => {
     const userId = (req as AuthenticatedRequest).userId;
     const { password, totp_code } = req.body;
-    const credential = password || totp_code;
-
-    if (!credential) {
-      return res
-        .status(400)
-        .json({ error: "A TOTP code or password is required" });
-    }
-
     try {
-      const user = await db.select().from(users).where(eq(users.id, userId));
-      if (!user || user.length === 0) {
+      const userRecord = await createCurrentUserRepository().findById(userId);
+      if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
 
-      const userRecord = user[0];
+      if (!totp_code || (!userRecord.isOidc && !password)) {
+        return res.status(400).json({
+          error: userRecord.isOidc
+            ? "A TOTP code is required"
+            : "Both password and TOTP code are required",
+        });
+      }
+
+      if (
+        !userRecord.isOidc &&
+        (!userRecord.passwordHash ||
+          !(await bcrypt.compare(password, userRecord.passwordHash)))
+      ) {
+        return res.status(401).json({ error: "Incorrect password" });
+      }
 
       if (!userRecord.totpEnabled) {
         return res.status(400).json({ error: "TOTP is not enabled" });
@@ -451,7 +447,7 @@ export function registerUserTotpRoutes(
       const userDataKey = authManager.getUserDataKey(userId);
       const verified = await verifyTotpReauth(
         userRecord,
-        credential,
+        totp_code,
         userDataKey,
       );
       if (!verified) {
@@ -474,10 +470,9 @@ export function registerUserTotpRoutes(
           )
         : backupCodesJson;
 
-      await db
-        .update(users)
-        .set({ totpBackupCodes: storedBackupCodes })
-        .where(eq(users.id, userId));
+      await createCurrentUserRepository().update(userId, {
+        totpBackupCodes: storedBackupCodes,
+      });
 
       res.json({ backup_codes: backupCodes });
     } catch (err) {
@@ -532,15 +527,12 @@ export function registerUserTotpRoutes(
         return res.status(401).json({ error: "Invalid temporary token" });
       }
 
-      const user = await db
-        .select()
-        .from(users)
-        .where(eq(users.id, decoded.userId));
-      if (!user || user.length === 0) {
+      const userRecord = await createCurrentUserRepository().findById(
+        decoded.userId,
+      );
+      if (!userRecord) {
         return res.status(404).json({ error: "User not found" });
       }
-
-      const userRecord = user[0];
 
       const lockStatus = loginRateLimiter.isTOTPLocked(userRecord.id);
       if (lockStatus.locked) {
@@ -580,14 +572,11 @@ export function registerUserTotpRoutes(
       );
 
       if (!totpSecret) {
-        await db
-          .update(users)
-          .set({
-            totpEnabled: false,
-            totpSecret: null,
-            totpBackupCodes: null,
-          })
-          .where(eq(users.id, userRecord.id));
+        await createCurrentUserRepository().update(userRecord.id, {
+          totpEnabled: false,
+          totpSecret: null,
+          totpBackupCodes: null,
+        });
 
         return res.status(400).json({
           error:
@@ -635,10 +624,9 @@ export function registerUserTotpRoutes(
         }
 
         backupCodes.splice(backupIndex, 1);
-        await db
-          .update(users)
-          .set({ totpBackupCodes: JSON.stringify(backupCodes) })
-          .where(eq(users.id, userRecord.id));
+        await createCurrentUserRepository().update(userRecord.id, {
+          totpBackupCodes: JSON.stringify(backupCodes),
+        });
       }
 
       loginRateLimiter.resetTOTPAttempts(userRecord.id);
@@ -646,18 +634,23 @@ export function registerUserTotpRoutes(
       const deviceInfo = parseUserAgent(req);
 
       if (rememberMe) {
-        const deviceFingerprint = generateDeviceFingerprint(deviceInfo);
-        await authManager.addTrustedDevice(
-          userRecord.id,
-          deviceFingerprint,
-          deviceInfo.type,
-          deviceInfo.deviceInfo,
+        const deviceFingerprint = generateDeviceFingerprint(
+          deviceInfo,
+          getDeviceId(req),
         );
-        authLogger.info("Device automatically trusted via Remember Me", {
-          operation: "totp_auto_trust",
-          userId: userRecord.id,
-          deviceType: deviceInfo.type,
-        });
+        if (deviceFingerprint) {
+          await authManager.addTrustedDevice(
+            userRecord.id,
+            deviceFingerprint,
+            deviceInfo.type,
+            deviceInfo.deviceInfo,
+          );
+          authLogger.info("Device automatically trusted via Remember Me", {
+            operation: "totp_auto_trust",
+            userId: userRecord.id,
+            deviceType: deviceInfo.type,
+          });
+        }
       }
 
       const token = await authManager.generateJWTToken(userRecord.id, {
@@ -683,14 +676,10 @@ export function registerUserTotpRoutes(
         ...(isNativeAppRequest(req) ? { token } : {}),
       };
 
-      const timeoutRow = db.$client
-        .prepare(
-          "SELECT value FROM settings WHERE key = 'session_timeout_hours'",
-        )
-        .get() as { value: string } | undefined;
-      const timeoutHours = timeoutRow
-        ? parseInt(timeoutRow.value, 10) || 24
-        : 24;
+      const timeoutValue = await createCurrentSettingsRepository().get(
+        "session_timeout_hours",
+      );
+      const timeoutHours = timeoutValue ? parseInt(timeoutValue, 10) || 24 : 24;
       const maxAge = rememberMe
         ? 30 * 24 * 60 * 60 * 1000
         : timeoutHours * 60 * 60 * 1000;

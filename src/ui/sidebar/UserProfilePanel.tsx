@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   getUserInfo,
+  getRemoteSyncUserInfo,
   getApiKeys,
   createApiKey,
   deleteApiKey,
@@ -13,10 +14,14 @@ import {
   enableTOTP,
   disableTOTP,
   getVersionInfo,
+  releaseUrlFrom,
   getUserRoles,
   saveUserPreferences,
   getUserPreferences,
 } from "@/main-axios";
+import { getDatabaseTransferUrl } from "@/lib/database-transfer-url";
+import { readRailPreference, setRailPreference } from "./rail-preferences";
+import { useHostSidebarPreferences } from "./tree/hooks/useHostSidebarPreferences";
 import {
   deleteWebAuthnCredential,
   listWebAuthnCredentials,
@@ -27,9 +32,12 @@ import {
 import type { UserRole } from "@/main-axios";
 import type React from "react";
 import { isElectron } from "@/lib/electron";
+import { RemoteSyncPanel } from "@/settings/RemoteSyncPanel.tsx";
+import { shouldForceLocalPreferenceStorage } from "@/settings/remote-sync-state";
 import { C2STunnelPresetManager } from "@/user/C2STunnelPresetManager";
 import { Button } from "@/components/button";
 import { Input } from "@/components/input";
+import { VersionBadge } from "@/components/version-badge";
 import {
   Dialog,
   DialogContent,
@@ -43,31 +51,28 @@ import {
   AlertCircle,
   CheckCircle2,
   ChevronDown,
-  Clock,
   Copy,
+  Database,
   Eye,
   EyeOff,
-  Hammer,
   KeyRound,
-  LayoutPanelLeft,
+  LayoutTemplate,
   Network,
   Palette,
-  Play,
-  Plug,
   Plus,
   RotateCcw,
-  ScrollText,
-  Server,
   Shield,
   ShieldCheck,
   Trash2,
   Type,
-  Usb,
   User,
   X,
-  Zap,
 } from "lucide-react";
 import { SettingRow, FakeSwitch } from "@/components/section-card";
+import { visibleRailItems } from "./rail-items";
+import { InterfacePresetSettings } from "./InterfacePresetSettings";
+import { useUiPreferencesContext } from "@/contexts/UiPreferencesContext";
+import { KeybindingsDialog } from "./KeybindingsDialog";
 import {
   ACCENT_PRESET_COLORS,
   applyAccentColor,
@@ -78,13 +83,17 @@ import type { ApiKey } from "@/main-axios";
 import { useTheme } from "@/components/theme-provider";
 import type { FontSizeId, ThemeId } from "@/types/ui-types";
 import { toast } from "sonner";
-import i18n from "@/i18n/i18n";
+import { changeAppLanguage, normalizeLanguageCode } from "@/i18n/i18n";
+import { clearLocalAdaptivePreferences } from "@/lib/local-adaptive-preferences";
+import { ConnectionDefaultsSettings } from "./ConnectionDefaultsSettings";
 
 type UserProfileSection =
   | "account"
+  | "interface"
   | "appearance"
   | "security"
   | "api-keys"
+  | "data"
   | "c2s-tunnels";
 
 const THEMES: { id: ThemeId; preview: string }[] = [
@@ -138,12 +147,13 @@ const LANGUAGES = [
   { code: "vi", label: "Tiếng Việt" },
 ];
 
-function AccordionSection({
+export function AccordionSection({
   id,
   label,
   icon,
   open,
   onToggle,
+  hidden = false,
   children,
 }: {
   id: string;
@@ -151,8 +161,11 @@ function AccordionSection({
   icon: React.ReactNode;
   open: boolean;
   onToggle: () => void;
+  hidden?: boolean;
   children: React.ReactNode;
 }) {
+  if (hidden) return null;
+
   return (
     <div className="border border-border bg-card overflow-hidden">
       <button
@@ -199,7 +212,7 @@ type CreatedProfileApiKey = {
   expiresAt?: string | null;
 };
 
-function NewApiKeyDialog({
+export function NewApiKeyDialog({
   open,
   onOpenChange,
   onAdd,
@@ -213,12 +226,23 @@ function NewApiKeyDialog({
   const { t } = useTranslation();
   const [name, setName] = useState("");
   const [expiry, setExpiry] = useState("");
+  const [createdToken, setCreatedToken] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  const close = () => {
+    setName("");
+    setExpiry("");
+    setCreatedToken(null);
+    onOpenChange(false);
+  };
 
   const handleCreate = async () => {
     if (!name.trim()) {
       toast.error(t("newUi.sidebar.userProfile.apiKeyNameRequired"));
       return;
     }
+    if (creating) return;
+    setCreating(true);
     try {
       const created = await createApiKey(
         name.trim(),
@@ -226,17 +250,22 @@ function NewApiKeyDialog({
         expiry ? new Date(expiry).toISOString() : undefined,
       );
       onAdd(created);
-      onOpenChange(false);
-      setName("");
-      setExpiry("");
+      setCreatedToken(created.token);
       toast.success(t("newUi.sidebar.userProfile.apiKeyCreated", { name }));
     } catch {
       toast.error(t("newUi.sidebar.userProfile.apiKeyCreateFailed"));
+    } finally {
+      setCreating(false);
     }
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (nextOpen || !createdToken) onOpenChange(nextOpen);
+      }}
+    >
       <DialogContent className="sm:max-w-md rounded-none border-border bg-card p-0 gap-0 overflow-hidden">
         <DialogHeader className="px-5 pt-5 pb-4 border-b border-border">
           <div className="flex items-center gap-2.5">
@@ -254,53 +283,93 @@ function NewApiKeyDialog({
           </div>
         </DialogHeader>
 
-        <div className="flex flex-col gap-4 px-5 py-4">
-          <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
-              {t("newUi.sidebar.userProfile.apiKeyNameLabel")}
-            </label>
-            <Input
-              autoFocus
-              placeholder={t("newUi.sidebar.userProfile.apiKeyNamePlaceholder")}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-              className="rounded-none bg-muted/50 border-border text-sm h-9"
-            />
+        {createdToken ? (
+          <div className="flex flex-col gap-3 px-5 py-4">
+            <span className="text-xs font-semibold text-accent-brand">
+              {t("newUi.sidebar.userProfile.apiKeyCreatedWarning")}
+            </span>
+            <div className="flex items-center gap-2 border border-border bg-muted/30 px-2 py-2">
+              <code className="min-w-0 flex-1 break-all text-xs text-accent-brand">
+                {createdToken}
+              </code>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7 shrink-0"
+                aria-label={t("newUi.sidebar.userProfile.copyApiKey")}
+                onClick={() => {
+                  copyToClipboard(createdToken);
+                  toast.info(t("newUi.sidebar.userProfile.copiedToClipboard"));
+                }}
+              >
+                <Copy className="size-3.5" />
+              </Button>
+            </div>
           </div>
+        ) : (
+          <div className="flex flex-col gap-4 px-5 py-4">
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+                {t("newUi.sidebar.userProfile.apiKeyNameLabel")}
+              </label>
+              <Input
+                autoFocus
+                placeholder={t(
+                  "newUi.sidebar.userProfile.apiKeyNamePlaceholder",
+                )}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleCreate()}
+                className="rounded-none bg-muted/50 border-border text-sm h-9"
+              />
+            </div>
 
-          <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
-              {t("newUi.sidebar.userProfile.expiryDateLabel")}{" "}
-              <span className="text-muted-foreground/50 normal-case font-medium">
-                ({t("newUi.sidebar.userProfile.optional")})
-              </span>
-            </label>
-            <Input
-              type="date"
-              value={expiry}
-              onChange={(e) => setExpiry(e.target.value)}
-              className="rounded-none bg-muted/50 border-border text-sm h-9"
-            />
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+                {t("newUi.sidebar.userProfile.expiryDateLabel")}{" "}
+                <span className="text-muted-foreground/50 normal-case font-medium">
+                  ({t("newUi.sidebar.userProfile.optional")})
+                </span>
+              </label>
+              <Input
+                type="date"
+                value={expiry}
+                onChange={(e) => setExpiry(e.target.value)}
+                className="rounded-none bg-muted/50 border-border text-sm h-9"
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         <DialogFooter className="px-5 py-3 border-t border-border bg-muted/20">
-          <Button
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-            className="rounded-none text-[10px] font-bold uppercase tracking-widest"
-          >
-            {t("newUi.sidebar.userProfile.cancel")}
-          </Button>
-          <Button
-            variant="outline"
-            className="border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 rounded-none text-[10px] font-bold uppercase tracking-widest gap-1.5"
-            onClick={handleCreate}
-          >
-            <KeyRound className="size-3" />{" "}
-            {t("newUi.sidebar.userProfile.createKey")}
-          </Button>
+          {createdToken ? (
+            <Button
+              variant="outline"
+              className="rounded-none border-accent-brand/40 text-[10px] font-bold uppercase tracking-widest text-accent-brand"
+              onClick={close}
+            >
+              {t("newUi.sidebar.userProfile.done")}
+            </Button>
+          ) : (
+            <>
+              <Button
+                variant="ghost"
+                onClick={close}
+                className="rounded-none text-[10px] font-bold uppercase tracking-widest"
+              >
+                {t("newUi.sidebar.userProfile.cancel")}
+              </Button>
+              <Button
+                variant="outline"
+                className="border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 rounded-none text-[10px] font-bold uppercase tracking-widest gap-1.5"
+                onClick={handleCreate}
+                disabled={creating}
+              >
+                <KeyRound className="size-3" />{" "}
+                {t("newUi.sidebar.userProfile.createKey")}
+              </Button>
+            </>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -421,18 +490,20 @@ function PasswordChangeSection({
 export function UserProfilePanel({
   username,
   onLogout,
-  onChangeServer,
   userPrefs,
   onPrefsChange,
+  remoteSyncInitialServerUrl,
 }: {
   username?: string;
   onLogout?: () => void;
-  onChangeServer?: () => void;
+  remoteSyncInitialServerUrl?: string;
   userPrefs?: {
     reopenTabsOnLogin: boolean;
     storageMode?: string | null;
     commandAutocomplete?: boolean | null;
     commandPaletteEnabled?: boolean | null;
+    aiAssistantEnabled?: boolean | null;
+    aiReadOnlyCommands?: boolean | null;
     showHostTags?: boolean | null;
     hostTrayOnClick?: boolean | null;
     compactHostView?: boolean | null;
@@ -445,7 +516,10 @@ export function UserProfilePanel({
     hiddenRailTabs?: string | null;
     statusColorScheme?: string | null;
   };
-  onPrefsChange?: (prefs: { reopenTabsOnLogin: boolean }) => void;
+  onPrefsChange?: (prefs: {
+    reopenTabsOnLogin?: boolean;
+    storageMode?: "local" | "cloud";
+  }) => void;
 }) {
   const { t } = useTranslation();
   const themeLabel: Record<ThemeId, string> = {
@@ -460,18 +534,21 @@ export function UserProfilePanel({
     "one-dark": t("newUi.sidebar.userProfile.themeOneDark"),
     gruvbox: t("newUi.sidebar.userProfile.themeGruvbox"),
   };
-  const [openSection, setOpenSection] = useState<UserProfileSection | null>(
-    "account",
+  const [openSections, setOpenSections] = useState<Set<UserProfileSection>>(
+    () => new Set(["account"]),
   );
 
   // User info
   const [userId, setUserId] = useState("");
+  const [accountUsername, setAccountUsername] = useState(username ?? "");
+  const [accountTotpEnabled, setAccountTotpEnabled] = useState(false);
   const [userRole, setUserRole] = useState("");
   const [authMethod, setAuthMethod] = useState("");
   const [version, setVersion] = useState("");
   const [versionStatus, setVersionStatus] = useState<
     "up_to_date" | "requires_update" | "beta"
   >("up_to_date");
+  const [releaseUrl, setReleaseUrl] = useState("");
   const [isOidc, setIsOidc] = useState(false);
   const [isDualAuth, setIsDualAuth] = useState(false);
 
@@ -498,6 +575,11 @@ export function UserProfilePanel({
   const [deletePassword, setDeletePassword] = useState("");
   const [deleteLoading, setDeleteLoading] = useState(false);
 
+  // Data export/import
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [exportLoading, setExportLoading] = useState(false);
+  const [importLoading, setImportLoading] = useState(false);
+
   // UI state
   const [showPassword, setShowPassword] = useState(false);
   const [newKeyOpen, setNewKeyOpen] = useState(false);
@@ -515,12 +597,64 @@ export function UserProfilePanel({
   const [fontSize, setFontSize] = useState<FontSizeId>(
     () => (localStorage.getItem("termix-font-size") as FontSizeId) ?? "md",
   );
-  const [language, setLanguage] = useState(
-    () => localStorage.getItem("i18nextLng") ?? "en",
+  const [language, setLanguage] = useState(() =>
+    normalizeLanguageCode(localStorage.getItem("i18nextLng")),
   );
   const [storageMode, setStorageMode] = useState<"local" | "cloud">(() =>
     userPrefs?.storageMode === "cloud" ? "cloud" : "local",
   );
+
+  useEffect(() => {
+    if (userPrefs?.storageMode) {
+      setStorageMode(userPrefs.storageMode === "cloud" ? "cloud" : "local");
+    }
+  }, [userPrefs?.storageMode]);
+
+  // Remote sync is not connected by default on the desktop app (it's an
+  // opt-in feature configured from this same panel). "cloud" storage mode
+  // and Termix ID both assume a real multi-device server account, so they
+  // stay hidden/forced-off until the user actually connects one.
+  const [isRemoteSyncConnected, setIsRemoteSyncConnected] = useState<
+    boolean | null
+  >(() => (isElectron() ? null : true));
+
+  useEffect(() => {
+    if (!isElectron()) return;
+    let cancelled = false;
+    const refreshSyncStatus = () => {
+      window.electronAPI
+        ?.invoke?.("get-remote-sync-config")
+        .then((config) => {
+          if (!cancelled) {
+            setIsRemoteSyncConnected(
+              !!(config as { serverUrl?: string } | null)?.serverUrl,
+            );
+          }
+        })
+        .catch(() => {});
+    };
+    refreshSyncStatus();
+    const unsubscribe = window.electronAPI?.onRemoteSyncStatusChanged?.(() =>
+      refreshSyncStatus(),
+    );
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      shouldForceLocalPreferenceStorage(
+        isElectron(),
+        isRemoteSyncConnected,
+        storageMode,
+      )
+    ) {
+      setStorageMode("local");
+      onPrefsChange?.({ storageMode: "local" });
+    }
+  }, [isRemoteSyncConnected, storageMode, onPrefsChange]);
 
   // Settings toggles — all backed by localStorage
   const [commandAutocomplete, setCommandAutocomplete] = useState(
@@ -533,29 +667,73 @@ export function UserProfilePanel({
     const v = localStorage.getItem("commandPaletteShortcutEnabled");
     return v !== null ? v === "true" : true;
   });
-  const [showHostTags, setShowHostTags] = useState(() => {
-    const v = localStorage.getItem("showHostTags");
-    return v !== null ? v === "true" : true;
-  });
-  const [hostTrayOnClick, setHostTrayOnClick] = useState(
-    () => localStorage.getItem("hostTrayOnClick") === "true",
+  const [keybindingsDialogOpen, setKeybindingsDialogOpen] = useState(false);
+  const [aiAssistantEnabled, setAiAssistantEnabled] = useState(false);
+  const [aiReadOnlyCommands, setAiReadOnlyCommands] = useState(false);
+  // Null until the status call answers; the whole section stays hidden while
+  // unknown so a user who cannot have the feature never sees it mentioned.
+  const [aiGloballyEnabled, setAiGloballyEnabled] = useState<boolean | null>(
+    null,
   );
-  const [compactHostView, setCompactHostView] = useState(
-    () => localStorage.getItem("compactHostView") === "true",
+  // Sidebar display customization (density, tags, tray trigger, status
+  // colors) now lives in the dedicated Customize Sidebar panel opened from
+  // the Hosts toolbar, not here -- resetToDefaults still needs write access.
+  const { update: updateSidebarPrefs } = useHostSidebarPreferences();
+  const uiPrefs = useUiPreferencesContext();
+
+  useEffect(() => {
+    let cancelled = false;
+    import("@/api/ai-api")
+      .then(({ getAiStatus }) => getAiStatus())
+      .then((status) => {
+        if (cancelled) return;
+        setAiGloballyEnabled(status.globallyEnabled);
+        setAiAssistantEnabled(status.enabled);
+        setAiReadOnlyCommands(status.allowReadOnlyCommands);
+      })
+      .catch(() => {
+        if (!cancelled) setAiGloballyEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Turning the assistant off also hides its rail tab, so declining removes
+   * the feature from view entirely rather than leaving an inert entry behind.
+   */
+  const applyAiEnabled = (enabled: boolean) => {
+    setAiAssistantEnabled(enabled);
+
+    const hidden = new Set<string>(
+      JSON.parse(localStorage.getItem("hiddenRailTabs") ?? "[]"),
+    );
+    if (enabled) hidden.delete("ai");
+    else hidden.add("ai");
+
+    const serialized = JSON.stringify([...hidden]);
+    localStorage.setItem("hiddenRailTabs", serialized);
+    setHiddenRailTabs(hidden);
+    window.dispatchEvent(new Event("hiddenRailTabsChanged"));
+
+    if (storageMode === "cloud") {
+      saveToCloud({ aiAssistantEnabled: enabled, hiddenRailTabs: serialized });
+    }
+  };
+  const [pinAppRail, setPinAppRail] = useState(() =>
+    readRailPreference("pinAppRail"),
   );
-  const [statusColorScheme, setStatusColorScheme] = useState(
-    () => localStorage.getItem("statusColorScheme") ?? "accent",
+  const [expandAppRailOnHover, setExpandAppRailOnHover] = useState(() =>
+    readRailPreference("expandAppRailOnHover"),
   );
-  const [pinAppRail, setPinAppRail] = useState(
-    () => localStorage.getItem("pinAppRail") === "true",
-  );
-  const [expandAppRailOnHover, setExpandAppRailOnHover] = useState(
-    () => localStorage.getItem("expandAppRailOnHover") !== "false",
-  );
-  const [foldersCollapsed, setFoldersCollapsed] = useState(
+  // Read values are unused now that the Snippets settings UI lives in
+  // SnippetsPanel.tsx; the setters still back the cloud-sync/reset/snapshot
+  // machinery for these two localStorage-backed prefs below.
+  const [_foldersCollapsed, setFoldersCollapsed] = useState(
     () => localStorage.getItem("defaultSnippetFoldersCollapsed") !== "false",
   );
-  const [confirmSnippetExecution, setConfirmSnippetExecution] = useState(
+  const [_confirmSnippetExecution, setConfirmSnippetExecution] = useState(
     () => localStorage.getItem("confirmSnippetExecution") === "true",
   );
   const [disableUpdateCheck, setDisableUpdateCheck] = useState(
@@ -581,11 +759,15 @@ export function UserProfilePanel({
 
   useEffect(() => {
     getUserInfo()
-      .then((info) => {
-        setUserId(info.userId);
-        setTotpEnabled(info.totp_enabled ?? false);
-        setIsOidc(info.is_oidc ?? false);
-        setIsDualAuth(info.is_dual_auth ?? false);
+      .then(async (localInfo) => {
+        setUserId(localInfo.userId);
+        setTotpEnabled(localInfo.totp_enabled ?? false);
+        setIsOidc(localInfo.is_oidc ?? false);
+        setIsDualAuth(localInfo.is_dual_auth ?? false);
+        const remoteInfo = await getRemoteSyncUserInfo();
+        const info = remoteInfo ?? localInfo;
+        setAccountUsername(info.username);
+        setAccountTotpEnabled(info.totp_enabled ?? false);
         setUserRole(
           info.is_admin
             ? t("newUi.sidebar.userProfile.roleAdministrator")
@@ -598,9 +780,13 @@ export function UserProfilePanel({
         } else {
           setAuthMethod(t("newUi.sidebar.userProfile.authMethodLocal"));
         }
-        getUserRoles(info.userId)
-          .then(({ roles }) => setUserRoles(roles ?? []))
-          .catch(() => {});
+        if (remoteInfo) {
+          setUserRoles(remoteInfo.roles ?? []);
+        } else {
+          getUserRoles(localInfo.userId)
+            .then(({ roles }) => setUserRoles(roles ?? []))
+            .catch(() => {});
+        }
       })
       .catch(() => {});
     getApiKeys()
@@ -613,9 +799,25 @@ export function UserProfilePanel({
       .then((info) => {
         setVersion(info.localVersion);
         setVersionStatus(info.status ?? "up_to_date");
+        setReleaseUrl(releaseUrlFrom(info));
       })
       .catch(() => {});
   }, [t]);
+
+  // The rail can toggle these from its right-click menu while this panel is
+  // mounted, so mirror the change back into the switches instead of letting
+  // them drift from the stored value.
+  useEffect(() => {
+    const pinHandler = () => setPinAppRail(readRailPreference("pinAppRail"));
+    const hoverHandler = () =>
+      setExpandAppRailOnHover(readRailPreference("expandAppRailOnHover"));
+    window.addEventListener("pinAppRailChanged", pinHandler);
+    window.addEventListener("expandAppRailOnHoverChanged", hoverHandler);
+    return () => {
+      window.removeEventListener("pinAppRailChanged", pinHandler);
+      window.removeEventListener("expandAppRailOnHoverChanged", hoverHandler);
+    };
+  }, []);
 
   function saveToCloud(prefs: Parameters<typeof saveUserPreferences>[0]) {
     void saveUserPreferences(prefs).catch(() => {});
@@ -623,6 +825,7 @@ export function UserProfilePanel({
 
   async function handleStorageModeChange(mode: "local" | "cloud") {
     setStorageMode(mode);
+    onPrefsChange?.({ storageMode: mode });
     if (mode === "cloud") {
       // Snapshot current browser localStorage values so any tab can restore them later
       const SNAPSHOT_KEYS = [
@@ -642,6 +845,13 @@ export function UserProfilePanel({
         "confirmTabClose",
         "hiddenRailTabs",
         "statusColorScheme",
+        "uiPreferences",
+        // Layout/view keys that were never snapshotted, so switching to cloud
+        // and back silently reset them.
+        "dashboardTab.slots",
+        "dashboardTab.mainWidthPct",
+        "termix-terminal-toolbar-density",
+        "fileManagerViewMode",
       ];
       const snap: Record<string, string | null> = { __theme: theme };
       for (const key of SNAPSHOT_KEYS) snap[key] = localStorage.getItem(key);
@@ -662,9 +872,8 @@ export function UserProfilePanel({
           applyAccentColor(prefs.accentColor);
         }
         if (prefs.language) {
-          setLanguage(prefs.language);
-          localStorage.setItem("i18nextLng", prefs.language);
-          void i18n.changeLanguage(prefs.language);
+          const language = await changeAppLanguage(prefs.language);
+          setLanguage(language);
         }
         if (prefs.commandAutocomplete != null) {
           setCommandAutocomplete(prefs.commandAutocomplete);
@@ -680,26 +889,15 @@ export function UserProfilePanel({
             String(prefs.commandPaletteEnabled),
           );
         }
-        if (prefs.showHostTags != null) {
-          setShowHostTags(prefs.showHostTags);
-          localStorage.setItem("showHostTags", String(prefs.showHostTags));
-          window.dispatchEvent(new CustomEvent("showHostTagsChanged"));
+        if (prefs.aiAssistantEnabled != null) {
+          setAiAssistantEnabled(prefs.aiAssistantEnabled);
         }
-        if (prefs.hostTrayOnClick != null) {
-          setHostTrayOnClick(prefs.hostTrayOnClick);
-          localStorage.setItem(
-            "hostTrayOnClick",
-            String(prefs.hostTrayOnClick),
-          );
+        if (prefs.aiReadOnlyCommands != null) {
+          setAiReadOnlyCommands(prefs.aiReadOnlyCommands);
         }
-        if (prefs.compactHostView != null) {
-          setCompactHostView(prefs.compactHostView);
-          localStorage.setItem(
-            "compactHostView",
-            String(prefs.compactHostView),
-          );
-          window.dispatchEvent(new CustomEvent("compactHostViewChanged"));
-        }
+        // showHostTags/hostTrayOnClick/compactHostView/statusColorScheme are
+        // no longer restored here -- useHostSidebarPreferences independently
+        // fetches its own authoritative copy from /host-sidebar/preferences.
         if (prefs.pinAppRail != null) {
           setPinAppRail(prefs.pinAppRail);
           localStorage.setItem("pinAppRail", String(prefs.pinAppRail));
@@ -747,11 +945,6 @@ export function UserProfilePanel({
           localStorage.setItem("hiddenRailTabs", prefs.hiddenRailTabs);
           window.dispatchEvent(new CustomEvent("hiddenRailTabsChanged"));
         }
-        if (prefs.statusColorScheme != null) {
-          setStatusColorScheme(prefs.statusColorScheme);
-          localStorage.setItem("statusColorScheme", prefs.statusColorScheme);
-          window.dispatchEvent(new CustomEvent("statusColorSchemeChanged"));
-        }
       } catch {
         // leave UI as-is on error
       }
@@ -763,6 +956,7 @@ export function UserProfilePanel({
   }
 
   function resetToDefaults() {
+    clearLocalAdaptivePreferences();
     const DEFAULT_ACCENT = "#f59145";
     setTheme("system");
     setFontSize("md");
@@ -772,20 +966,21 @@ export function UserProfilePanel({
     localStorage.setItem("termix-accent", DEFAULT_ACCENT);
     applyAccentColor(DEFAULT_ACCENT);
     setLanguage("en");
-    localStorage.setItem("i18nextLng", "en");
-    void i18n.changeLanguage("en");
+    void changeAppLanguage("en");
     setCommandAutocomplete(false);
     localStorage.setItem("commandAutocomplete", "false");
     setCommandPaletteEnabled(true);
     localStorage.setItem("commandPaletteShortcutEnabled", "true");
-    setShowHostTags(true);
-    localStorage.setItem("showHostTags", "true");
-    window.dispatchEvent(new CustomEvent("showHostTagsChanged"));
-    setHostTrayOnClick(false);
-    localStorage.setItem("hostTrayOnClick", "false");
-    setCompactHostView(false);
-    localStorage.setItem("compactHostView", "false");
-    window.dispatchEvent(new CustomEvent("compactHostViewChanged"));
+    updateSidebarPrefs((prev) => ({
+      ...prev,
+      display: {
+        ...prev.display,
+        showTags: true,
+        trayTrigger: "hover",
+        density: "comfortable",
+        statusColorScheme: "accent",
+      },
+    }));
     setPinAppRail(false);
     localStorage.setItem("pinAppRail", "false");
     window.dispatchEvent(new Event("pinAppRailChanged"));
@@ -803,9 +998,9 @@ export function UserProfilePanel({
     setHiddenRailTabs(new Set());
     localStorage.removeItem("hiddenRailTabs");
     window.dispatchEvent(new CustomEvent("hiddenRailTabsChanged"));
-    setStatusColorScheme("accent");
-    localStorage.setItem("statusColorScheme", "accent");
-    window.dispatchEvent(new CustomEvent("statusColorSchemeChanged"));
+    // Back to the preset that matches the pre-preset UI, with nothing pinned.
+    uiPrefs?.setPreset("balanced");
+    uiPrefs?.clearAllOverrides();
     if (storageMode === "cloud") {
       saveToCloud({
         theme: "system",
@@ -814,9 +1009,6 @@ export function UserProfilePanel({
         language: "en",
         commandAutocomplete: false,
         commandPaletteEnabled: true,
-        showHostTags: true,
-        hostTrayOnClick: false,
-        compactHostView: false,
         pinAppRail: false,
         expandAppRailOnHover: true,
         foldersCollapsed: true,
@@ -824,7 +1016,6 @@ export function UserProfilePanel({
         disableUpdateCheck: false,
         confirmTabClose: false,
         hiddenRailTabs: "[]",
-        statusColorScheme: "accent",
       });
     }
     localSnapshot.current = {};
@@ -862,10 +1053,9 @@ export function UserProfilePanel({
     localStorage.setItem("termix-accent", restoredAccent);
     applyAccentColor(restoredAccent);
 
-    const restoredLang = restore("i18nextLng", "en") ?? "en";
+    const restoredLang = normalizeLanguageCode(restore("i18nextLng", "en"));
     setLanguage(restoredLang);
-    localStorage.setItem("i18nextLng", restoredLang);
-    void i18n.changeLanguage(restoredLang);
+    void changeAppLanguage(restoredLang);
 
     const restoredAutocomplete =
       restore("commandAutocomplete", "false") === "true";
@@ -880,20 +1070,9 @@ export function UserProfilePanel({
       String(restoredPalette),
     );
 
-    const restoredHostTags = restore("showHostTags", "true") !== "false";
-    setShowHostTags(restoredHostTags);
-    localStorage.setItem("showHostTags", String(restoredHostTags));
-    window.dispatchEvent(new CustomEvent("showHostTagsChanged"));
-
-    const restoredTrayOnClick = restore("hostTrayOnClick", "false") === "true";
-    setHostTrayOnClick(restoredTrayOnClick);
-    localStorage.setItem("hostTrayOnClick", String(restoredTrayOnClick));
-
-    const restoredCompactHostView =
-      restore("compactHostView", "false") === "true";
-    setCompactHostView(restoredCompactHostView);
-    localStorage.setItem("compactHostView", String(restoredCompactHostView));
-    window.dispatchEvent(new CustomEvent("compactHostViewChanged"));
+    // showHostTags/hostTrayOnClick/compactHostView/statusColorScheme are no
+    // longer part of this snapshot -- useHostSidebarPreferences keeps its own
+    // localStorage cache independent of storageMode switches.
 
     const restoredPinRail = restore("pinAppRail", "false") === "true";
     setPinAppRail(restoredPinRail);
@@ -954,12 +1133,6 @@ export function UserProfilePanel({
     }
     window.dispatchEvent(new CustomEvent("hiddenRailTabsChanged"));
 
-    const restoredStatusScheme =
-      restore("statusColorScheme", "accent") ?? "accent";
-    setStatusColorScheme(restoredStatusScheme);
-    localStorage.setItem("statusColorScheme", restoredStatusScheme);
-    window.dispatchEvent(new CustomEvent("statusColorSchemeChanged"));
-
     localStorage.removeItem("termix-local-snapshot");
     localSnapshot.current = {};
   }
@@ -984,14 +1157,21 @@ export function UserProfilePanel({
   }
 
   function handleLanguageChange(code: string) {
-    setLanguage(code);
-    localStorage.setItem("i18nextLng", code);
-    i18n.changeLanguage(code);
-    if (storageMode === "cloud") saveToCloud({ language: code });
+    void changeAppLanguage(code)
+      .then((language) => {
+        setLanguage(language);
+        if (storageMode === "cloud") saveToCloud({ language });
+      })
+      .catch(() => {});
   }
 
   function toggle(id: UserProfileSection) {
-    setOpenSection((prev) => (prev === id ? null : id));
+    setOpenSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   }
 
   async function handleStartTotpSetup() {
@@ -1019,6 +1199,7 @@ export function UserProfilePanel({
       const result = await enableTOTP(totpCode);
       setTotpBackupCodes(result.backup_codes ?? []);
       setTotpEnabled(true);
+      if (!isRemoteSyncConnected) setAccountTotpEnabled(true);
       setTotpStep("backup");
       toast.success(t("newUi.sidebar.userProfile.totpEnabledSuccess"));
     } catch (e: unknown) {
@@ -1039,6 +1220,7 @@ export function UserProfilePanel({
     try {
       await disableTOTP(disableTotpInput);
       setTotpEnabled(false);
+      if (!isRemoteSyncConnected) setAccountTotpEnabled(false);
       setShowDisableTotp(false);
       setDisableTotpInput("");
       toast.success(t("newUi.sidebar.userProfile.totpDisabledSuccess"));
@@ -1114,120 +1296,265 @@ export function UserProfilePanel({
     }
   }
 
+  async function handleExportData() {
+    setExportLoading(true);
+    try {
+      const apiUrl = getDatabaseTransferUrl("export", {
+        electron: isElectron(),
+        configuredServerUrl: null,
+        location: window.location,
+      });
+
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({}),
+      });
+
+      if (response.ok) {
+        const blob = await response.blob();
+        const contentDisposition = response.headers.get("content-disposition");
+        const filename =
+          contentDisposition?.match(/filename="([^"]+)"/)?.[1] ||
+          "termix-export.sqlite";
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        toast.success(t("newUi.sidebar.userProfile.exportSuccess"));
+      } else {
+        const err = await response.json().catch(() => ({}));
+        toast.error(err.error || t("newUi.sidebar.userProfile.exportFailed"));
+      }
+    } catch {
+      toast.error(t("newUi.sidebar.userProfile.exportFailed"));
+    } finally {
+      setExportLoading(false);
+    }
+  }
+
+  async function handleImportData() {
+    if (!importFile) {
+      toast.error(t("newUi.sidebar.userProfile.importSelectFile"));
+      return;
+    }
+    setImportLoading(true);
+    try {
+      const apiUrl = getDatabaseTransferUrl("import", {
+        electron: isElectron(),
+        configuredServerUrl: null,
+        location: window.location,
+      });
+
+      const formData = new FormData();
+      formData.append("file", importFile);
+
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        credentials: "include",
+        body: formData,
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          const s = result.summary;
+          const total =
+            (s.sshHostsImported || 0) +
+            (s.sshCredentialsImported || 0) +
+            (s.fileManagerItemsImported || 0) +
+            (s.dismissedAlertsImported || 0) +
+            (s.settingsImported || 0);
+          toast.success(
+            t("newUi.sidebar.userProfile.importCompleted", {
+              total,
+              skipped: s.skippedItems || 0,
+            }),
+          );
+          setImportFile(null);
+          setTimeout(() => window.location.reload(), 1500);
+        } else {
+          toast.error(
+            t("newUi.sidebar.userProfile.importFailed", {
+              error: result.summary?.errors?.join(", ") || "Unknown error",
+            }),
+          );
+        }
+      } else {
+        const err = await response.json().catch(() => ({}));
+        toast.error(
+          t("newUi.sidebar.userProfile.importFailed", {
+            error: err.error || "Unknown error",
+          }),
+        );
+      }
+    } catch {
+      toast.error(
+        t("newUi.sidebar.userProfile.importFailed", {
+          error: "Unknown error",
+        }),
+      );
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
   const canChangePasword = !isOidc || isDualAuth;
 
   return (
-    <div className="flex flex-col gap-2 p-3">
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-2 p-3">
       <NewApiKeyDialog
         open={newKeyOpen}
         onOpenChange={setNewKeyOpen}
-        onAdd={(key) => setApiKeys((prev) => [key, ...prev])}
+        onAdd={(key) => setApiKeys((prev) => [key as ApiKey, ...prev])}
         userId={userId}
       />
 
-      {/* Storage mode toggle */}
-      <div className="border border-border bg-card px-3 py-2.5 flex flex-col gap-2">
-        <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-          {t("newUi.sidebar.userProfile.storageModeSwitch")}
-        </span>
-        <div className="flex border border-border overflow-hidden w-full">
-          <button
-            onClick={() => handleStorageModeChange("local")}
-            className={`flex-1 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
-              storageMode === "local"
-                ? "bg-accent-brand text-white"
-                : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
-            }`}
-          >
-            {t("newUi.sidebar.userProfile.storageModeLocal")}
-          </button>
-          <button
-            onClick={() => handleStorageModeChange("cloud")}
-            className={`flex-1 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
-              storageMode === "cloud"
-                ? "bg-accent-brand text-white"
-                : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
-            }`}
-          >
-            {t("newUi.sidebar.userProfile.storageModeCloud")}
-          </button>
+      {/* Donate banner */}
+      <div className="border border-accent-brand/40 bg-accent-brand/10 px-3 py-2.5 flex flex-col gap-1.5">
+        <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-accent-brand">
+          {t("newUi.sidebar.userProfile.donateTitle")}
         </div>
         <p className="text-[10px] text-muted-foreground leading-relaxed">
-          {t("newUi.sidebar.userProfile.storageModeDescription")}
+          {t("newUi.sidebar.userProfile.donateDescription")}
         </p>
-        <button
-          onClick={resetToDefaults}
-          className="self-start flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
+        <p className="text-[10px] text-muted-foreground leading-relaxed">
+          {t("newUi.sidebar.userProfile.donateMilestones")}
+        </p>
+        <a
+          href="https://donate.termix.site/"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="self-start flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest bg-accent-brand text-white px-2 py-1 hover:opacity-90 transition-opacity"
         >
-          <RotateCcw className="size-3" />
-          {t("newUi.sidebar.userProfile.resetToDefaults")}
-        </button>
+          {t("newUi.sidebar.userProfile.donateButton")}
+        </a>
       </div>
+
+      {/* Storage mode toggle — only meaningful once a remote server is
+          connected; with no sync there's nowhere for "cloud" to sync to,
+          so this stays forced to local storage and hidden. */}
+      {(!isElectron() || isRemoteSyncConnected === true) && (
+        <div className="border border-border bg-card px-3 py-2.5 flex flex-col gap-2">
+          <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+            {t("newUi.sidebar.userProfile.storageModeSwitch")}
+          </span>
+          <div className="flex border border-border overflow-hidden w-full">
+            <button
+              onClick={() => handleStorageModeChange("local")}
+              className={`flex-1 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                storageMode === "local"
+                  ? "bg-accent-brand text-white"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
+              }`}
+            >
+              {t("newUi.sidebar.userProfile.storageModeLocal")}
+            </button>
+            <button
+              onClick={() => handleStorageModeChange("cloud")}
+              className={`flex-1 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                storageMode === "cloud"
+                  ? "bg-accent-brand text-white"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
+              }`}
+            >
+              {t("newUi.sidebar.userProfile.storageModeCloud")}
+            </button>
+          </div>
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            {t("newUi.sidebar.userProfile.storageModeDescription")}
+          </p>
+          <button
+            onClick={resetToDefaults}
+            className="self-start flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <RotateCcw className="size-3" />
+            {t("newUi.sidebar.userProfile.resetToDefaults")}
+          </button>
+        </div>
+      )}
 
       {/* Account */}
       <AccordionSection
         id="account"
         label={t("newUi.sidebar.userProfile.sectionAccount")}
         icon={<User className="size-3.5" />}
-        open={openSection === "account"}
+        open={openSections.has("account")}
         onToggle={() => toggle("account")}
       >
         <div className="flex flex-col gap-0 pt-2">
-          <div className="grid grid-cols-2 gap-x-4 gap-y-0">
-            <div className="flex flex-col py-2">
-              <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
-                {t("newUi.sidebar.userProfile.usernameLabel")}
-              </span>
-              <span className="text-sm font-semibold mt-0.5">
-                {username ?? "—"}
-              </span>
+          {isElectron() ? (
+            <div className="border border-accent-brand/40 bg-accent-brand/10 px-3 py-2.5 mb-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-accent-brand">
+                <ShieldCheck className="size-3.5" />
+                {t("newUi.sidebar.userProfile.desktopProfileTitle")}
+              </div>
+              <p className="text-[10px] text-muted-foreground leading-relaxed mt-1">
+                {t("newUi.sidebar.userProfile.desktopProfileDescription")}
+              </p>
             </div>
-            <div className="flex flex-col py-2">
-              <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
-                {t("newUi.sidebar.userProfile.roleLabel")}
-              </span>
-              <div className="flex flex-wrap gap-1 mt-0.5">
-                <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold border border-accent-brand/40 bg-accent-brand/10 text-accent-brand w-fit">
-                  {userRole || "—"}
+          ) : (
+            <div className="grid grid-cols-2 gap-x-4 gap-y-0">
+              <div className="flex flex-col py-2">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
+                  {t("newUi.sidebar.userProfile.usernameLabel")}
                 </span>
-                {userRoles.map((r) => (
-                  <span
-                    key={r.roleId}
-                    className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold border border-border bg-muted text-muted-foreground w-fit"
-                  >
-                    {r.roleDisplayName}
+                <span className="text-sm font-semibold mt-0.5">
+                  {accountUsername || "—"}
+                </span>
+              </div>
+              <div className="flex flex-col py-2">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
+                  {t("newUi.sidebar.userProfile.roleLabel")}
+                </span>
+                <div className="flex flex-wrap gap-1 mt-0.5">
+                  <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold border border-accent-brand/40 bg-accent-brand/10 text-accent-brand w-fit">
+                    {userRole || "—"}
                   </span>
-                ))}
+                  {userRoles.map((r) => (
+                    <span
+                      key={r.roleId}
+                      className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold border border-border bg-muted text-muted-foreground w-fit"
+                    >
+                      {r.roleDisplayName}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="flex flex-col py-2">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
+                  {t("newUi.sidebar.userProfile.authMethodLabel")}
+                </span>
+                <span className="text-sm font-semibold mt-0.5">
+                  {authMethod || "—"}
+                </span>
+              </div>
+              <div className="flex flex-col py-2">
+                <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
+                  {t("newUi.sidebar.userProfile.twoFaLabel")}
+                </span>
+                <span className="flex items-center gap-1 mt-0.5">
+                  {accountTotpEnabled ? (
+                    <>
+                      <ShieldCheck className="size-3.5 text-accent-brand" />
+                      <span className="text-sm font-semibold text-accent-brand">
+                        {t("newUi.sidebar.userProfile.twoFaOn")}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-sm font-semibold text-muted-foreground">
+                      {t("newUi.sidebar.userProfile.twoFaOff")}
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
-            <div className="flex flex-col py-2">
-              <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
-                {t("newUi.sidebar.userProfile.authMethodLabel")}
-              </span>
-              <span className="text-sm font-semibold mt-0.5">
-                {authMethod || "—"}
-              </span>
-            </div>
-            <div className="flex flex-col py-2">
-              <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
-                {t("newUi.sidebar.userProfile.twoFaLabel")}
-              </span>
-              <span className="flex items-center gap-1 mt-0.5">
-                {totpEnabled ? (
-                  <>
-                    <ShieldCheck className="size-3.5 text-accent-brand" />
-                    <span className="text-sm font-semibold text-accent-brand">
-                      {t("newUi.sidebar.userProfile.twoFaOn")}
-                    </span>
-                  </>
-                ) : (
-                  <span className="text-sm font-semibold text-muted-foreground">
-                    {t("newUi.sidebar.userProfile.twoFaOff")}
-                  </span>
-                )}
-              </span>
-            </div>
-          </div>
+          )}
 
           <div className="border-t border-border pt-3 mt-1">
             <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
@@ -1237,68 +1564,105 @@ export function UserProfilePanel({
               <span className="text-sm font-bold text-accent-brand">
                 {version ? `v${version}` : "—"}
               </span>
-              <span
-                className={`text-[10px] px-1.5 py-0.5 font-semibold leading-none ${
-                  versionStatus === "beta"
-                    ? "bg-blue-500/20 text-blue-400"
-                    : versionStatus === "requires_update"
-                      ? "bg-yellow-500/20 text-yellow-400"
-                      : "bg-accent-brand/20 text-accent-brand"
-                }`}
-              >
-                {versionStatus === "beta"
-                  ? t("dashboard.beta").toUpperCase()
-                  : versionStatus === "requires_update"
-                    ? t("dashboard.updateAvailable").toUpperCase()
-                    : t("dashboardTab.stable")}
-              </span>
+              <VersionBadge status={versionStatus} releaseUrl={releaseUrl} />
             </div>
           </div>
 
-          {isElectron() && onChangeServer && (
+          <div className="border-t border-border pt-3 mt-3">
+            <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-xs font-medium">
+                  {t("newUi.sidebar.userProfile.betaProgramTitle")}
+                </span>
+                <span className="text-[10px] text-muted-foreground">
+                  {t("newUi.sidebar.userProfile.betaProgramDescription")}{" "}
+                  <a
+                    href="https://github.com/Termix-SSH/Support/issues/new?template=beta_feedback.yml"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-accent-brand hover:underline"
+                  >
+                    {t("newUi.sidebar.userProfile.betaProgramFeedback")}
+                  </a>
+                </span>
+              </div>
+              <a
+                href="https://docs.termix.site/install/server/docker#beta-builds"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="shrink-0 ml-3 flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest border border-border px-2 py-1.5 hover:bg-muted/40 transition-colors"
+              >
+                {t("newUi.sidebar.userProfile.betaProgramLearnMore")}
+              </a>
+            </div>
+          </div>
+
+          <div className="border-t border-border pt-3 mt-3">
+            <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-xs font-medium">
+                  {t("newUi.sidebar.userProfile.cliTitle")}
+                </span>
+                <span className="text-[10px] text-muted-foreground">
+                  {t("newUi.sidebar.userProfile.cliDescription")}
+                </span>
+              </div>
+              <a
+                href="https://docs.termix.site/cli"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="shrink-0 ml-3 flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest border border-border px-2 py-1.5 hover:bg-muted/40 transition-colors"
+              >
+                {t("newUi.sidebar.userProfile.cliLearnMore")}
+              </a>
+            </div>
+          </div>
+
+          {isElectron() && (
+            <div className="border-t border-border pt-3 mt-3">
+              <RemoteSyncPanel initialServerUrl={remoteSyncInitialServerUrl} />
+            </div>
+          )}
+
+          {!isElectron() && (
             <div className="border-t border-border pt-3 mt-3">
               <div className="flex items-center justify-between">
                 <div className="flex flex-col gap-0.5">
-                  <span className="text-xs font-medium">
-                    {t("serverConfig.changeServer")}
+                  <span className="text-xs font-medium text-destructive">
+                    {t("newUi.sidebar.userProfile.deleteAccount")}
                   </span>
                   <span className="text-[10px] text-muted-foreground">
-                    {t("newUi.sidebar.userProfile.changeServerDescription")}
+                    {t("newUi.sidebar.userProfile.deleteAccountDescription")}
                   </span>
                 </div>
                 <Button
                   variant="outline"
                   size="sm"
-                  className="shrink-0 ml-3 text-[10px] h-7"
-                  onClick={onChangeServer}
+                  className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive shrink-0 ml-3 text-[10px] h-7"
+                  onClick={() => setShowDeleteConfirm(true)}
                 >
-                  <Server className="size-3" />
-                  {t("serverConfig.changeServer")}
+                  {t("newUi.sidebar.userProfile.deleteButton")}
                 </Button>
               </div>
             </div>
           )}
+        </div>
+      </AccordionSection>
 
-          <div className="border-t border-border pt-3 mt-3">
-            <div className="flex items-center justify-between">
-              <div className="flex flex-col gap-0.5">
-                <span className="text-xs font-medium text-destructive">
-                  {t("newUi.sidebar.userProfile.deleteAccount")}
-                </span>
-                <span className="text-[10px] text-muted-foreground">
-                  {t("newUi.sidebar.userProfile.deleteAccountDescription")}
-                </span>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive shrink-0 ml-3 text-[10px] h-7"
-                onClick={() => setShowDeleteConfirm(true)}
-              >
-                {t("newUi.sidebar.userProfile.deleteButton")}
-              </Button>
-            </div>
-          </div>
+      {/* Interface */}
+      <AccordionSection
+        id="interface"
+        label={t("newUi.sidebar.userProfile.sectionInterface")}
+        icon={<LayoutTemplate size={13} />}
+        open={openSections.has("interface")}
+        onToggle={() => toggle("interface")}
+      >
+        <div className="flex flex-col gap-4 pt-3">
+          <InterfacePresetSettings
+            onRunSetupAgain={() =>
+              window.dispatchEvent(new Event("termix:open-onboarding"))
+            }
+          />
         </div>
       </AccordionSection>
 
@@ -1307,7 +1671,7 @@ export function UserProfilePanel({
         id="appearance"
         label={t("newUi.sidebar.userProfile.sectionAppearance")}
         icon={<Palette className="size-3.5" />}
-        open={openSection === "appearance"}
+        open={openSections.has("appearance")}
         onToggle={() => toggle("appearance")}
       >
         <div className="flex flex-col gap-4 pt-3">
@@ -1452,6 +1816,7 @@ export function UserProfilePanel({
             <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
               {t("newUi.sidebar.userProfile.settingsTerminal")}
             </span>
+            <ConnectionDefaultsSettings />
             <SettingRow
               label={t("newUi.sidebar.userProfile.commandAutocomplete")}
               description={t(
@@ -1467,6 +1832,43 @@ export function UserProfilePanel({
                     saveToCloud({ commandAutocomplete: v });
                 }}
               />
+            </SettingRow>
+            <div className="flex flex-col gap-1.5 py-3 border-b border-border">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-medium leading-snug">
+                  {t("newUi.sidebar.userProfile.localEcho")}
+                </span>
+                <span className="text-xs text-muted-foreground leading-snug">
+                  {t("newUi.sidebar.userProfile.localEchoDesc")}
+                </span>
+              </div>
+              <select
+                defaultValue={
+                  localStorage.getItem("terminalLocalEchoMode") ?? "auto"
+                }
+                onChange={(e) =>
+                  localStorage.setItem("terminalLocalEchoMode", e.target.value)
+                }
+                className="h-7 border border-border bg-background px-2 text-xs outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="off">{t("hosts.localEchoOff")}</option>
+                <option value="auto">{t("hosts.localEchoAuto")}</option>
+                <option value="on">{t("hosts.localEchoOn")}</option>
+              </select>
+            </div>
+            <SettingRow
+              label={t("newUi.sidebar.userProfile.keyboardShortcuts")}
+              description={t(
+                "newUi.sidebar.userProfile.keyboardShortcutsDescription",
+              )}
+            >
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setKeybindingsDialogOpen(true)}
+              >
+                {t("newUi.sidebar.userProfile.manageShortcuts")}
+              </Button>
             </SettingRow>
             <div className="flex flex-col gap-1.5 py-3 border-b border-border">
               <div className="flex flex-col gap-0.5">
@@ -1516,6 +1918,34 @@ export function UserProfilePanel({
                 }}
               />
             </SettingRow>
+            {aiGloballyEnabled && (
+              <>
+                <SettingRow
+                  label={t("ai.enableTitle")}
+                  description={t("ai.enableDescription")}
+                >
+                  <FakeSwitch
+                    checked={aiAssistantEnabled}
+                    onChange={applyAiEnabled}
+                  />
+                </SettingRow>
+                {aiAssistantEnabled && (
+                  <SettingRow
+                    label={t("ai.readOnlyCommands")}
+                    description={t("ai.readOnlyCommandsDescription")}
+                  >
+                    <FakeSwitch
+                      checked={aiReadOnlyCommands}
+                      onChange={(v) => {
+                        setAiReadOnlyCommands(v);
+                        if (storageMode === "cloud")
+                          saveToCloud({ aiReadOnlyCommands: v });
+                      }}
+                    />
+                  </SettingRow>
+                )}
+              </>
+            )}
             <SettingRow
               label={t("newUi.sidebar.userProfile.reopenTabsOnLogin")}
               description={t("newUi.sidebar.userProfile.reopenTabsOnLoginDesc")}
@@ -1550,68 +1980,11 @@ export function UserProfilePanel({
 
           <div className="flex flex-col gap-1 border-t border-border pt-3">
             <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
-              {t("newUi.sidebar.userProfile.settingsSidebar")}
+              {t("newUi.sidebar.userProfile.settingsAppRail")}
             </span>
-            <SettingRow
-              label={t("newUi.sidebar.userProfile.showHostTags")}
-              description={t("newUi.sidebar.userProfile.showHostTagsDesc")}
-            >
-              <FakeSwitch
-                checked={showHostTags}
-                onChange={(v) => {
-                  setShowHostTags(v);
-                  localStorage.setItem("showHostTags", v.toString());
-                  window.dispatchEvent(new Event("showHostTagsChanged"));
-                  if (storageMode === "cloud") saveToCloud({ showHostTags: v });
-                }}
-              />
-            </SettingRow>
-            <SettingRow
-              label={t("newUi.sidebar.userProfile.hostTrayOnClick")}
-              description={t("newUi.sidebar.userProfile.hostTrayOnClickDesc")}
-            >
-              <FakeSwitch
-                checked={hostTrayOnClick}
-                onChange={(v) => {
-                  setHostTrayOnClick(v);
-                  localStorage.setItem("hostTrayOnClick", v.toString());
-                  window.dispatchEvent(new Event("hostTrayOnClickChanged"));
-                  if (storageMode === "cloud")
-                    saveToCloud({ hostTrayOnClick: v });
-                }}
-              />
-            </SettingRow>
-            <SettingRow
-              label={t("newUi.sidebar.userProfile.compactHostView")}
-              description={t("newUi.sidebar.userProfile.compactHostViewDesc")}
-            >
-              <FakeSwitch
-                checked={compactHostView}
-                onChange={(v) => {
-                  setCompactHostView(v);
-                  localStorage.setItem("compactHostView", v.toString());
-                  window.dispatchEvent(new Event("compactHostViewChanged"));
-                  if (storageMode === "cloud")
-                    saveToCloud({ compactHostView: v });
-                }}
-              />
-            </SettingRow>
-            <SettingRow
-              label={t("newUi.sidebar.userProfile.statusColors")}
-              description={t("newUi.sidebar.userProfile.statusColorsDesc")}
-            >
-              <FakeSwitch
-                checked={statusColorScheme === "status"}
-                onChange={(v) => {
-                  const scheme = v ? "status" : "accent";
-                  setStatusColorScheme(scheme);
-                  localStorage.setItem("statusColorScheme", scheme);
-                  window.dispatchEvent(new Event("statusColorSchemeChanged"));
-                  if (storageMode === "cloud")
-                    saveToCloud({ statusColorScheme: scheme });
-                }}
-              />
-            </SettingRow>
+            <p className="text-[10px] text-muted-foreground mb-2">
+              {t("newUi.sidebar.userProfile.sidebarSettingsMoved")}
+            </p>
             <SettingRow
               label={t("newUi.sidebar.userProfile.pinAppRail")}
               description={t("newUi.sidebar.userProfile.pinAppRailDesc")}
@@ -1620,9 +1993,7 @@ export function UserProfilePanel({
                 checked={pinAppRail}
                 onChange={(v) => {
                   setPinAppRail(v);
-                  localStorage.setItem("pinAppRail", v.toString());
-                  window.dispatchEvent(new Event("pinAppRailChanged"));
-                  if (storageMode === "cloud") saveToCloud({ pinAppRail: v });
+                  setRailPreference("pinAppRail", v);
                 }}
               />
             </SettingRow>
@@ -1636,12 +2007,7 @@ export function UserProfilePanel({
                 checked={expandAppRailOnHover}
                 onChange={(v) => {
                   setExpandAppRailOnHover(v);
-                  localStorage.setItem("expandAppRailOnHover", v.toString());
-                  window.dispatchEvent(
-                    new Event("expandAppRailOnHoverChanged"),
-                  );
-                  if (storageMode === "cloud")
-                    saveToCloud({ expandAppRailOnHover: v });
+                  setRailPreference("expandAppRailOnHover", v);
                 }}
               />
             </SettingRow>
@@ -1654,129 +2020,35 @@ export function UserProfilePanel({
             <p className="text-[10px] text-muted-foreground mb-2">
               {t("newUi.sidebar.userProfile.navigationTabsDesc")}
             </p>
-            {(
-              [
-                {
-                  id: "hosts",
-                  icon: <Server size={12} />,
-                  label: t("nav.hosts"),
-                },
-                {
-                  id: "credentials",
-                  icon: <KeyRound size={12} />,
-                  label: t("nav.credentials"),
-                },
-                {
-                  id: "connections",
-                  icon: <Plug size={12} />,
-                  label: t("nav.connections"),
-                },
-                {
-                  id: "quick-connect",
-                  icon: <Zap size={12} />,
-                  label: t("nav.quickConnect"),
-                },
-                {
-                  id: "serial",
-                  icon: <Usb size={12} />,
-                  label: t("nav.serial"),
-                },
-                {
-                  id: "ssh-tools",
-                  icon: <Hammer size={12} />,
-                  label: t("nav.sshTools"),
-                },
-                {
-                  id: "snippets",
-                  icon: <Play size={12} />,
-                  label: t("nav.snippets"),
-                },
-                {
-                  id: "history",
-                  icon: <Clock size={12} />,
-                  label: t("nav.history"),
-                },
-                {
-                  id: "session-logs",
-                  icon: <ScrollText size={12} />,
-                  label: t("nav.sessionLogs"),
-                },
-                {
-                  id: "split-screen",
-                  icon: <LayoutPanelLeft size={12} />,
-                  label: t("nav.splitScreen"),
-                },
-                {
-                  id: "network_graph",
-                  icon: <Network size={12} />,
-                  label: t("nav.networkGraph"),
-                },
-              ] as { id: string; icon: React.ReactNode; label: string }[]
-            ).map((tab) => (
-              <div
-                key={tab.id}
-                className="flex items-center justify-between py-1.5"
-              >
-                <span className="flex items-center gap-1.5 text-xs font-medium text-foreground">
-                  <span className="text-muted-foreground">{tab.icon}</span>
-                  {tab.label}
-                </span>
-                <FakeSwitch
-                  checked={!hiddenRailTabs.has(tab.id)}
-                  onChange={(visible) => {
-                    const next = new Set(hiddenRailTabs);
-                    if (visible) next.delete(tab.id);
-                    else next.add(tab.id);
-                    setHiddenRailTabs(next);
-                    const serialized = JSON.stringify([...next]);
-                    localStorage.setItem("hiddenRailTabs", serialized);
-                    window.dispatchEvent(new Event("hiddenRailTabsChanged"));
-                    if (storageMode === "cloud")
-                      saveToCloud({ hiddenRailTabs: serialized });
-                  }}
-                />
-              </div>
-            ))}
-          </div>
-
-          <div className="flex flex-col gap-1 border-t border-border pt-3">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
-              {t("newUi.sidebar.userProfile.settingsSnippets")}
-            </span>
-            <SettingRow
-              label={t("newUi.sidebar.userProfile.foldersCollapsed")}
-              description={t("newUi.sidebar.userProfile.foldersCollapsedDesc")}
-            >
-              <FakeSwitch
-                checked={foldersCollapsed}
-                onChange={(v) => {
-                  setFoldersCollapsed(v);
-                  localStorage.setItem(
-                    "defaultSnippetFoldersCollapsed",
-                    v.toString(),
-                  );
-                  window.dispatchEvent(
-                    new Event("defaultSnippetFoldersCollapsedChanged"),
-                  );
-                  if (storageMode === "cloud")
-                    saveToCloud({ foldersCollapsed: v });
-                }}
-              />
-            </SettingRow>
-            <SettingRow
-              label={t("newUi.sidebar.userProfile.confirmExecution")}
-              description={t("newUi.sidebar.userProfile.confirmExecutionDesc")}
-            >
-              <FakeSwitch
-                checked={confirmSnippetExecution}
-                onChange={(v) => {
-                  setConfirmSnippetExecution(v);
-                  localStorage.setItem("confirmSnippetExecution", v.toString());
-                  if (storageMode === "cloud")
-                    saveToCloud({ confirmSnippetExecution: v });
-                }}
-              />
-            </SettingRow>
+            {visibleRailItems()
+              .filter((tab) => tab.id !== "ai" || aiGloballyEnabled)
+              .map((tab) => (
+                <div
+                  key={tab.id}
+                  className="flex items-center justify-between py-1.5"
+                >
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+                    <span className="text-muted-foreground">
+                      <tab.icon size={12} />
+                    </span>
+                    {t(tab.labelKey)}
+                  </span>
+                  <FakeSwitch
+                    checked={!hiddenRailTabs.has(tab.id)}
+                    onChange={(visible) => {
+                      const next = new Set(hiddenRailTabs);
+                      if (visible) next.delete(tab.id);
+                      else next.add(tab.id);
+                      setHiddenRailTabs(next);
+                      const serialized = JSON.stringify([...next]);
+                      localStorage.setItem("hiddenRailTabs", serialized);
+                      window.dispatchEvent(new Event("hiddenRailTabsChanged"));
+                      if (storageMode === "cloud")
+                        saveToCloud({ hiddenRailTabs: serialized });
+                    }}
+                  />
+                </div>
+              ))}
           </div>
 
           <div className="flex flex-col gap-1 border-t border-border pt-3">
@@ -1803,12 +2075,15 @@ export function UserProfilePanel({
         </div>
       </AccordionSection>
 
-      {/* Security */}
+      {/* The embedded desktop backend auto-authenticates its machine-local
+          profile, so server login controls would imply protection they do
+          not provide. Remote Sync owns its separate account UI above. */}
       <AccordionSection
+        hidden={isElectron()}
         id="security"
         label={t("newUi.sidebar.userProfile.sectionSecurity")}
         icon={<Shield className="size-3.5" />}
-        open={openSection === "security"}
+        open={openSections.has("security")}
         onToggle={() => toggle("security")}
       >
         <div className="flex flex-col gap-4 pt-3">
@@ -2139,7 +2414,7 @@ export function UserProfilePanel({
         id="api-keys"
         label={t("newUi.sidebar.userProfile.sectionApiKeys")}
         icon={<Network className="size-3.5" />}
-        open={openSection === "api-keys"}
+        open={openSections.has("api-keys")}
         onToggle={() => toggle("api-keys")}
       >
         <div className="flex flex-col gap-2 pt-3">
@@ -2240,12 +2515,86 @@ export function UserProfilePanel({
         </div>
       </AccordionSection>
 
+      <AccordionSection
+        id="data"
+        label={t("newUi.sidebar.userProfile.sectionData")}
+        icon={<Database className="size-3.5" />}
+        open={openSections.has("data")}
+        onToggle={() => toggle("data")}
+      >
+        <div className="flex flex-col gap-3 pt-3">
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium">
+              {t("newUi.sidebar.userProfile.exportData")}
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              {t("newUi.sidebar.userProfile.exportDataDesc")}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand mt-1"
+              onClick={handleExportData}
+              disabled={exportLoading}
+            >
+              {exportLoading
+                ? t("newUi.sidebar.userProfile.exporting")
+                : t("newUi.sidebar.userProfile.export")}
+            </Button>
+          </div>
+          <div className="flex flex-col gap-1.5 border-t border-border pt-3">
+            <span className="text-xs font-medium">
+              {t("newUi.sidebar.userProfile.importData")}
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              {importFile
+                ? t("newUi.sidebar.userProfile.importDataSelected", {
+                    name: importFile.name,
+                  })
+                : t("newUi.sidebar.userProfile.importDataDesc")}
+            </span>
+            <div className="flex items-center gap-2 mt-1">
+              <div className="relative">
+                <input
+                  type="file"
+                  accept=".sqlite,.db"
+                  onChange={(e) => setImportFile(e.target.files?.[0] ?? null)}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="pointer-events-none text-xs"
+                >
+                  {importFile
+                    ? t("newUi.sidebar.userProfile.changeFile")
+                    : t("newUi.sidebar.userProfile.selectFile")}
+                </Button>
+              </div>
+              {importFile && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand"
+                  onClick={handleImportData}
+                  disabled={importLoading}
+                >
+                  {importLoading
+                    ? t("newUi.sidebar.userProfile.importing")
+                    : t("newUi.sidebar.userProfile.import")}
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </AccordionSection>
+
       {isElectron() && (
         <AccordionSection
           id="c2s-tunnels"
           label={t("newUi.sidebar.userProfile.sectionC2sTunnels")}
           icon={<Activity className="size-3.5" />}
-          open={openSection === "c2s-tunnels"}
+          open={openSections.has("c2s-tunnels")}
           onToggle={() => toggle("c2s-tunnels")}
         >
           <C2STunnelPresetManager />
@@ -2315,6 +2664,10 @@ export function UserProfilePanel({
           </div>
         </DialogContent>
       </Dialog>
+      <KeybindingsDialog
+        open={keybindingsDialogOpen}
+        onOpenChange={setKeybindingsDialogOpen}
+      />
     </div>
   );
 }

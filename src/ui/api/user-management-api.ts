@@ -1,12 +1,29 @@
-import { authApi, handleApiError } from "@/main-axios";
-import type { UserInfo } from "@/main-axios";
+import { authApi, handleApiError, type UserInfo } from "@/main-axios";
+import { getConnectedRemoteApi } from "@/lib/remote-server-api";
 
 // USER MANAGEMENT
 // ============================================================================
 
-export async function getUserList(): Promise<{ users: UserInfo[] }> {
+export type UserListOptions = {
+  /** Case-insensitive username substring filter. */
+  search?: string;
+  /** Page size. Omit to fetch every user (what the share pickers want). */
+  limit?: number;
+  offset?: number;
+};
+
+export async function getUserList(
+  options: UserListOptions = {},
+): Promise<{ users: UserInfo[]; total?: number }> {
   try {
-    const response = await authApi.get("/users/list");
+    const api = (await getConnectedRemoteApi()) ?? authApi;
+    const response = await api.get("/users/list", {
+      params: {
+        ...(options.search ? { search: options.search } : {}),
+        ...(options.limit ? { limit: options.limit } : {}),
+        ...(options.offset ? { offset: options.offset } : {}),
+      },
+    });
     return response.data;
   } catch (error) {
     handleApiError(error, "fetch user list");
@@ -161,6 +178,48 @@ export async function deleteAccount(
   }
 }
 
+// Raw axios errors propagate here so callers can detect the 409
+// DATA_WIPE_REQUIRED code and re-submit with confirmDataWipe.
+export async function adminResetUserPassword(
+  userId: string,
+  newPassword: string,
+  confirmDataWipe = false,
+): Promise<{ message: string; dataWiped?: boolean }> {
+  const response = await authApi.post("/users/admin/reset-password", {
+    userId,
+    newPassword,
+    confirmDataWipe,
+  });
+  return response.data;
+}
+
+export async function adminDisableUserTotp(
+  userId: string,
+): Promise<{ message: string }> {
+  try {
+    const response = await authApi.post("/users/admin/totp/disable", {
+      userId,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "disable user TOTP");
+  }
+}
+
+export async function adminExportUserData(
+  userId: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.get(
+      `/users/admin/export/${encodeURIComponent(userId)}`,
+      { timeout: 120000 },
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "export user data");
+  }
+}
+
 export async function updateRegistrationAllowed(
   allowed: boolean,
 ): Promise<Record<string, unknown>> {
@@ -198,6 +257,7 @@ export async function updateOidcAutoProvision(
 
 export async function getOidcSilentLoginDefault(): Promise<{
   enabled: boolean;
+  locked?: boolean;
 }> {
   try {
     const response = await authApi.get("/users/oidc-silent-login-default");

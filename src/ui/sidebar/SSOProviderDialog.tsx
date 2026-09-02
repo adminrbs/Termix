@@ -9,8 +9,12 @@ import {
   DialogTitle,
 } from "@/components/dialog";
 import { toast } from "sonner";
-import type { SSOProvider, SSOProviderType } from "@/types/index";
-import type { OIDCProviderConfig, LDAPProviderConfig } from "@/types/index";
+import {
+  type LDAPProviderConfig,
+  type OIDCProviderConfig,
+  type SSOProvider,
+  type SSOProviderType,
+} from "@/types/index";
 import { createSSOProvider, updateSSOProvider } from "@/api/sso-provider-api";
 
 type ApiErrorLike = {
@@ -29,6 +33,26 @@ const PROVIDER_TYPE_OPTIONS: { value: SSOProviderType; label: string }[] = [
   { value: "google", label: "Google" },
   { value: "ldap", label: "LDAP" },
 ];
+
+const githubDefaults = {
+  authorization_url: "https://github.com/login/oauth/authorize",
+  token_url: "https://github.com/login/oauth/access_token",
+  issuer_url: "https://token.actions.githubusercontent.com",
+  userinfo_url: "https://api.github.com/user",
+  scopes: "read:user user:email",
+  identifier_path: "id",
+  name_path: "name",
+};
+
+const googleDefaults = {
+  authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
+  token_url: "https://oauth2.googleapis.com/token",
+  issuer_url: "https://accounts.google.com",
+  userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo",
+  scopes: "openid email profile",
+  identifier_path: "sub",
+  name_path: "name",
+};
 
 type SSOProviderDialogProps = {
   open: boolean;
@@ -55,7 +79,7 @@ function emptyOidc(): OIDCProviderConfig {
   };
 }
 
-function emptyLdap(): LDAPProviderConfig {
+function emptyLdap(): Required<LDAPProviderConfig> {
   return {
     host: "",
     port: 389,
@@ -362,7 +386,8 @@ export function SSOProviderDialog({
             </Button>
             <Button
               size="sm"
-              className="text-xs bg-accent-brand text-white hover:bg-accent-brand/90"
+              variant="outline"
+              className="text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand"
               onClick={handleSave}
               disabled={saving}
             >
@@ -408,24 +433,6 @@ function OIDCConfigFields({
   simplified: boolean;
   t: (key: string) => string;
 }) {
-  const githubDefaults = {
-    authorization_url: "https://github.com/login/oauth/authorize",
-    token_url: "https://github.com/login/oauth/access_token",
-    issuer_url: "https://token.actions.githubusercontent.com",
-    userinfo_url: "https://api.github.com/user",
-    scopes: "read:user user:email",
-    identifier_path: "id",
-    name_path: "name",
-  };
-  const googleDefaults = {
-    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
-    token_url: "https://oauth2.googleapis.com/token",
-    issuer_url: "https://accounts.google.com",
-    userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo",
-    scopes: "openid email profile",
-    identifier_path: "sub",
-    name_path: "name",
-  };
   const docsHref = simplified
     ? "https://docs.termix.site/features/authentication/github-google"
     : "https://docs.termix.site/features/authentication/oidc";

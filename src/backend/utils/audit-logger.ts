@@ -1,9 +1,23 @@
 import type { Request } from "express";
-import { db } from "../database/db/index.js";
-import { auditLogs } from "../database/db/schema.js";
+import { forwardAuditEntry } from "./audit-forwarder.js";
+import {
+  createCurrentAuditLogRepository,
+  createCurrentUserRepository,
+} from "../database/repositories/factory.js";
+import { getClientIp } from "./request-origin.js";
 
-const PRUNE_MAX = 10000;
-const PRUNE_TARGET = 9000;
+/**
+ * Resolves the display name to store alongside the entry. It is denormalised on
+ * purpose: the record has to stay readable after the account is gone.
+ */
+export async function getAuditUsername(userId: string): Promise<string> {
+  try {
+    const actor = await createCurrentUserRepository().findById(userId);
+    return actor?.username ?? userId;
+  } catch {
+    return userId;
+  }
+}
 
 export interface AuditLogParams {
   userId: string;
@@ -20,8 +34,12 @@ export interface AuditLogParams {
 }
 
 export async function logAudit(params: AuditLogParams): Promise<void> {
+  // Local storage is the source of truth and runs first; forwarding is a copy
+  // and must never delay or fail the audited operation.
+  void forwardAuditEntry(params).catch(() => {});
+
   try {
-    await db.insert(auditLogs).values({
+    await createCurrentAuditLogRepository().create({
       userId: params.userId,
       username: params.username,
       action: params.action,
@@ -34,21 +52,6 @@ export async function logAudit(params: AuditLogParams): Promise<void> {
       success: params.success,
       errorMessage: params.errorMessage ?? null,
     });
-
-    const countResult = db.$client
-      .prepare("SELECT COUNT(*) as count FROM audit_logs")
-      .get() as { count: number };
-
-    if (countResult.count >= PRUNE_MAX) {
-      const deleteCount = countResult.count - PRUNE_TARGET;
-      db.$client
-        .prepare(
-          `DELETE FROM audit_logs WHERE id IN (
-            SELECT id FROM audit_logs ORDER BY timestamp ASC LIMIT ?
-          )`,
-        )
-        .run(deleteCount);
-    }
   } catch {
     // audit logging must never throw and break the caller
   }
@@ -58,11 +61,6 @@ export function getRequestMeta(req: Request): {
   ipAddress: string;
   userAgent: string;
 } {
-  const forwarded = req.headers["x-forwarded-for"];
-  const ipAddress =
-    (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]) ||
-    req.ip ||
-    "";
   const userAgent = (req.headers["user-agent"] as string) || "";
-  return { ipAddress, userAgent };
+  return { ipAddress: getClientIp(req), userAgent };
 }

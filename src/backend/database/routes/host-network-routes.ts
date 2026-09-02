@@ -1,10 +1,9 @@
+import { getErrorMessage } from "../../utils/error-message.js";
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import type { Request, RequestHandler, Response, Router } from "express";
-import { and, eq } from "drizzle-orm";
 import { sendWakeOnLan, isValidMac } from "../../utils/wake-on-lan.js";
 import { sshLogger } from "../../utils/logger.js";
-import { db } from "../db/index.js";
-import { hosts } from "../db/schema.js";
+import { createCurrentHostResolutionRepository } from "../repositories/factory.js";
 
 interface HostNetworkRoutesDeps {
   authenticateJWT: RequestHandler;
@@ -85,7 +84,7 @@ export function registerHostNetworkRoutes(
         });
         res.status(500).json({
           success: false,
-          error: error instanceof Error ? error.message : "Unknown error",
+          error: getErrorMessage(error),
         });
       }
     },
@@ -100,16 +99,12 @@ export function registerHostNetworkRoutes(
       const userId = (req as AuthenticatedRequest).userId;
 
       try {
-        const host = await db
-          .select({
-            macAddress: hosts.macAddress,
-            wolBroadcastAddress: hosts.wolBroadcastAddress,
-          })
-          .from(hosts)
-          .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
-          .then((rows) => rows[0]);
+        const host = await createCurrentHostResolutionRepository().findHostById(
+          hostId,
+          userId,
+        );
 
-        if (!host) {
+        if (!host || host.userId !== userId) {
           return res.status(404).json({ error: "Host not found" });
         }
 
@@ -138,10 +133,7 @@ export function registerHostNetworkRoutes(
           hostId,
         });
         res.status(500).json({
-          error:
-            error instanceof Error
-              ? error.message
-              : "Failed to send WoL packet",
+          error: getErrorMessage(error, "Failed to send WoL packet"),
         });
       }
     },

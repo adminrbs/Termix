@@ -82,7 +82,7 @@
         "arch": ["x64", "arm64", "armv7l"]
       }
     ],
-    "icon": "public/icon.png",
+    "icon": "public/icons",
     "category": "Development",
     "executableName": "termix",
     "maintainer": "Termix <mail@termix.site>",
@@ -117,24 +117,24 @@
     "category": "public.app-category.developer-tools",
     "hardenedRuntime": true,
     "gatekeeperAssess": false,
-    "entitlements": "build/entitlements.mac.plist",
-    "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+    "entitlements": "packaging/build/entitlements.mac.plist",
+    "entitlementsInherit": "packaging/build/entitlements.mac.inherit.plist",
     "type": "distribution",
     "minimumSystemVersion": "10.15",
     "mergeASARs": false,
-    "singleArchFiles": "**/*.{node,bare}",
-    "x64ArchFiles": "**/*.{node,bare}"
+    "singleArchFiles": "**/*.{node,bare,dylib}",
+    "x64ArchFiles": "**/{*.{node,bare,dylib},node-pty/prebuilds/*/spawn-helper}"
   },
   "dmg": {
     "artifactName": "termix_macos_${arch}_dmg.${ext}",
     "sign": true
   },
-  "afterPack": "build/after-pack.cjs",
-  "afterSign": "build/notarize.cjs",
+  "afterPack": "packaging/build/after-pack.cjs",
+  "afterSign": "packaging/build/notarize.cjs",
   "mas": {
-    "provisioningProfile": "build/Termix_Mac_App_Store.provisionprofile",
-    "entitlements": "build/entitlements.mas.plist",
-    "entitlementsInherit": "build/entitlements.mas.inherit.plist",
+    "provisioningProfile": "packaging/build/Termix_Mac_App_Store.provisionprofile",
+    "entitlements": "packaging/build/entitlements.mas.plist",
+    "entitlementsInherit": "packaging/build/entitlements.mas.inherit.plist",
     "hardenedRuntime": false,
     "gatekeeperAssess": false,
     "type": "distribution",

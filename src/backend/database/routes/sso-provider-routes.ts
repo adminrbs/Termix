@@ -3,61 +3,65 @@ import type {
   OIDCProviderConfig,
 } from "../../../types/index.js";
 import type { Router } from "express";
-import { db } from "../db/index.js";
-import { ssoProviders } from "../db/schema.js";
-import { eq, asc } from "drizzle-orm";
 import { authLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import type { SSOProviderType } from "../../../types/index.js";
-import { getOIDCConfigFromEnv } from "./user-oidc-utils.js";
+import { createCurrentSsoProviderRepository } from "../repositories/factory.js";
+import {
+  getOIDCConfigFromEnv,
+  isOIDCEnvOverrideEnabled,
+} from "./user-oidc-utils.js";
+import {
+  decryptSsoConfigSecrets,
+  encryptSsoConfigSecrets,
+} from "../../utils/system-secret-crypto.js";
+import { isTrustedProxyAuthEnabled } from "../../utils/trusted-proxy-auth.js";
+
+function isOidcLike(type: SSOProviderType): boolean {
+  return type === "oidc" || type === "github" || type === "google";
+}
+
+export function isValidOidcIssuer(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return (
+      ["http:", "https:"].includes(url.protocol) &&
+      !/\/userinfo\/?$/i.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
 
 const authManager = AuthManager.getInstance();
 
-function decryptProviderConfig(
+/**
+ * SSO secrets belong to the installation, not to a user: `sso_providers` has no
+ * userId and the values must be readable during login, before anyone is
+ * authenticated. They are encrypted with the system key rather than a user DEK.
+ * Values written by the previous base64 scheme still decode, and are upgraded
+ * the next time the provider is saved.
+ */
+async function decryptProviderConfig(
   configJson: string,
   _userId: string,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   let config: Record<string, unknown>;
   try {
     config = JSON.parse(configJson);
   } catch {
     return {};
   }
-
-  for (const field of ["client_secret", "bindPassword"] as const) {
-    const val = config[field] as string | undefined;
-    if (val?.startsWith("encoded:")) {
-      try {
-        config[field] = Buffer.from(val.substring(8), "base64").toString(
-          "utf8",
-        );
-      } catch {
-        config[field] = "[ENCODING ERROR]";
-      }
-    }
-  }
-  return config;
+  return decryptSsoConfigSecrets(config);
 }
 
-function encryptProviderConfig(
+async function encryptProviderConfig(
   config: Record<string, unknown>,
   _userId: string,
   _providerId: string,
-): string {
-  const encoded: Record<string, unknown> = { ...config };
-  if (
-    typeof config.client_secret === "string" &&
-    !config.client_secret.startsWith("encoded:")
-  ) {
-    encoded.client_secret = `encoded:${Buffer.from(config.client_secret).toString("base64")}`;
-  }
-  if (
-    typeof config.bindPassword === "string" &&
-    !config.bindPassword.startsWith("encoded:")
-  ) {
-    encoded.bindPassword = `encoded:${Buffer.from(config.bindPassword).toString("base64")}`;
-  }
-  return JSON.stringify(encoded);
+): Promise<string> {
+  return JSON.stringify(await encryptSsoConfigSecrets(config));
 }
 
 function applyProviderDefaults(
@@ -91,7 +95,6 @@ function applyProviderDefaults(
 }
 
 export function registerSSOProviderRoutes(router: Router): void {
-  const authenticateJWT = authManager.createAuthMiddleware();
   const requireAdmin = authManager.createAdminMiddleware();
 
   /**
@@ -108,21 +111,19 @@ export function registerSSOProviderRoutes(router: Router): void {
    */
   router.get("/sso-providers", async (_req, res) => {
     try {
-      const providers = await db
-        .select({
-          id: ssoProviders.id,
-          name: ssoProviders.name,
-          type: ssoProviders.type,
-          displayOrder: ssoProviders.displayOrder,
-        })
-        .from(ssoProviders)
-        .where(eq(ssoProviders.enabled, true))
-        .orderBy(asc(ssoProviders.displayOrder), asc(ssoProviders.id));
+      const envConfig = getOIDCConfigFromEnv();
+      if (envConfig && isOIDCEnvOverrideEnabled()) {
+        return res.json([
+          { id: 0, name: "SSO", type: "oidc", displayOrder: 0 },
+        ]);
+      }
+
+      const providers =
+        await createCurrentSsoProviderRepository().listEnabledPublic();
 
       // If no DB providers exist, synthesize one from env vars so SSO login
       // remains available when configured purely via environment variables.
       if (providers.length === 0) {
-        const envConfig = getOIDCConfigFromEnv();
         if (envConfig) {
           providers.push({ id: 0, name: "SSO", type: "oidc", displayOrder: 0 });
         }
@@ -150,15 +151,14 @@ export function registerSSOProviderRoutes(router: Router): void {
   router.get("/sso-providers/admin", requireAdmin, async (req, res) => {
     const userId = (req as AuthenticatedRequest).userId;
     try {
-      const rows = await db
-        .select()
-        .from(ssoProviders)
-        .orderBy(asc(ssoProviders.displayOrder), asc(ssoProviders.id));
+      const rows = await createCurrentSsoProviderRepository().listAll();
 
-      const result = rows.map((row) => ({
-        ...row,
-        config: decryptProviderConfig(row.config, userId),
-      }));
+      const result = await Promise.all(
+        rows.map(async (row) => ({
+          ...row,
+          config: await decryptProviderConfig(row.config, userId),
+        })),
+      );
       res.json(result);
     } catch (err) {
       authLogger.error("Failed to list SSO providers (admin)", err);
@@ -215,6 +215,12 @@ export function registerSSOProviderRoutes(router: Router): void {
       if (!validTypes.includes(type)) {
         return res.status(400).json({ error: "Invalid provider type" });
       }
+      if (isTrustedProxyAuthEnabled() && enabled && isOidcLike(type)) {
+        return res.status(409).json({
+          error:
+            "OIDC providers cannot be enabled with trusted proxy authentication",
+        });
+      }
 
       const configWithDefaults =
         type === "github" || type === "google"
@@ -236,6 +242,12 @@ export function registerSSOProviderRoutes(router: Router): void {
         if (missing.length > 0 && type === "oidc") {
           return res.status(400).json({
             error: `Missing required OIDC fields: ${missing.join(", ")}`,
+          });
+        }
+        if (c.issuer_url && !isValidOidcIssuer(c.issuer_url)) {
+          return res.status(400).json({
+            error:
+              "Issuer URL must be an HTTP(S) issuer and not a userinfo endpoint",
           });
         }
         if (
@@ -267,22 +279,19 @@ export function registerSSOProviderRoutes(router: Router): void {
       }
 
       const tempId = `new-${Date.now()}`;
-      const encryptedConfig = encryptProviderConfig(
+      const encryptedConfig = await encryptProviderConfig(
         configWithDefaults as Record<string, unknown>,
         userId,
         tempId,
       );
 
-      const [inserted] = await db
-        .insert(ssoProviders)
-        .values({
-          name: name.trim(),
-          type,
-          enabled,
-          displayOrder,
-          config: encryptedConfig,
-        })
-        .returning();
+      const inserted = await createCurrentSsoProviderRepository().create({
+        name: name.trim(),
+        type,
+        enabled,
+        displayOrder,
+        config: encryptedConfig,
+      });
 
       authLogger.info("SSO provider created", {
         operation: "sso_provider_create",
@@ -292,7 +301,7 @@ export function registerSSOProviderRoutes(router: Router): void {
       });
       res.status(201).json({
         ...inserted,
-        config: decryptProviderConfig(inserted.config, userId),
+        config: await decryptProviderConfig(inserted.config, userId),
       });
     } catch (err) {
       authLogger.error("Failed to create SSO provider", err);
@@ -327,12 +336,9 @@ export function registerSSOProviderRoutes(router: Router): void {
       return res.status(400).json({ error: "Invalid provider ID" });
     }
     try {
-      const existing = await db
-        .select()
-        .from(ssoProviders)
-        .where(eq(ssoProviders.id, providerId))
-        .limit(1);
-      if (existing.length === 0) {
+      const providerRepository = createCurrentSsoProviderRepository();
+      const existing = await providerRepository.findById(providerId);
+      if (!existing) {
         return res.status(404).json({ error: "SSO provider not found" });
       }
 
@@ -350,10 +356,23 @@ export function registerSSOProviderRoutes(router: Router): void {
         config?: Record<string, unknown>;
       };
 
-      let encryptedConfig = existing[0].config;
+      const effectiveType = type ?? (existing.type as SSOProviderType);
+      const effectiveEnabled = enabled ?? existing.enabled;
+      if (
+        isTrustedProxyAuthEnabled() &&
+        effectiveEnabled &&
+        isOidcLike(effectiveType)
+      ) {
+        return res.status(409).json({
+          error:
+            "OIDC providers cannot be enabled with trusted proxy authentication",
+        });
+      }
+
+      let encryptedConfig = existing.config;
       if (rawConfig !== undefined) {
-        const existingDecrypted = decryptProviderConfig(
-          existing[0].config,
+        const existingDecrypted = await decryptProviderConfig(
+          existing.config,
           userId,
         );
         const mergedConfig = {
@@ -362,25 +381,35 @@ export function registerSSOProviderRoutes(router: Router): void {
           ),
           ...rawConfig,
         };
-        encryptedConfig = encryptProviderConfig(
+        if (
+          isOidcLike(effectiveType) &&
+          mergedConfig.issuer_url &&
+          !isValidOidcIssuer(mergedConfig.issuer_url)
+        ) {
+          return res.status(400).json({
+            error:
+              "Issuer URL must be an HTTP(S) issuer and not a userinfo endpoint",
+          });
+        }
+        encryptedConfig = await encryptProviderConfig(
           mergedConfig,
           userId,
           String(providerId),
         );
       }
 
-      const [updated] = await db
-        .update(ssoProviders)
-        .set({
-          ...(name !== undefined ? { name: name.trim() } : {}),
-          ...(type !== undefined ? { type } : {}),
-          ...(enabled !== undefined ? { enabled } : {}),
-          ...(displayOrder !== undefined ? { displayOrder } : {}),
-          config: encryptedConfig,
-          updatedAt: new Date().toISOString(),
-        })
-        .where(eq(ssoProviders.id, providerId))
-        .returning();
+      const updated = await providerRepository.update(providerId, {
+        ...(name !== undefined ? { name: name.trim() } : {}),
+        ...(type !== undefined ? { type } : {}),
+        ...(enabled !== undefined ? { enabled } : {}),
+        ...(displayOrder !== undefined ? { displayOrder } : {}),
+        config: encryptedConfig,
+        updatedAt: new Date().toISOString(),
+      });
+
+      if (!updated) {
+        return res.status(404).json({ error: "SSO provider not found" });
+      }
 
       authLogger.info("SSO provider updated", {
         operation: "sso_provider_update",
@@ -389,7 +418,7 @@ export function registerSSOProviderRoutes(router: Router): void {
       });
       res.json({
         ...updated,
-        config: decryptProviderConfig(updated.config, userId),
+        config: await decryptProviderConfig(updated.config, userId),
       });
     } catch (err) {
       authLogger.error("Failed to update SSO provider", err);
@@ -426,27 +455,21 @@ export function registerSSOProviderRoutes(router: Router): void {
       return res.status(400).json({ error: "Invalid provider ID" });
     }
     try {
-      const existing = await db
-        .select()
-        .from(ssoProviders)
-        .where(eq(ssoProviders.id, providerId))
-        .limit(1);
-      if (existing.length === 0) {
+      const providerRepository = createCurrentSsoProviderRepository();
+      const existing = await providerRepository.findById(providerId);
+      if (!existing) {
         return res.status(404).json({ error: "SSO provider not found" });
       }
 
-      const associatedUsers = db.$client
-        .prepare(
-          "SELECT COUNT(*) as count FROM users WHERE sso_provider_id = ?",
-        )
-        .get(providerId) as { count: number };
-      if (associatedUsers.count > 0) {
+      const associatedUserCount =
+        await providerRepository.countUsersByProviderId(providerId);
+      if (associatedUserCount > 0) {
         return res.status(409).json({
-          error: `Cannot delete provider: ${associatedUsers.count} user(s) are associated with it`,
+          error: `Cannot delete provider: ${associatedUserCount} user(s) are associated with it`,
         });
       }
 
-      await db.delete(ssoProviders).where(eq(ssoProviders.id, providerId));
+      await providerRepository.delete(providerId);
       authLogger.info("SSO provider deleted", {
         operation: "sso_provider_delete",
         userId,

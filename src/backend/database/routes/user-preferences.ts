@@ -1,17 +1,19 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
-import express from "express";
-import { db } from "../db/index.js";
-import { userPreferences } from "../db/schema.js";
-import { eq } from "drizzle-orm";
-import type { Request, Response } from "express";
+import express, { type Request, type Response } from "express";
 import { databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
+import { createCurrentUserPreferenceRepository } from "../repositories/factory.js";
+import type {
+  UserPreferenceRecord,
+  UserPreferenceUpdate,
+} from "../repositories/user-preference-repository.js";
+import { isValidKeybinding } from "./keybinding-validation.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
 
-const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
+const pickPreferences = (row?: UserPreferenceRecord | null) => ({
   reopenTabsOnLogin: row?.reopenTabsOnLogin ?? false,
   theme: row?.theme ?? null,
   fontSize: row?.fontSize ?? null,
@@ -29,15 +31,35 @@ const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
   disableUpdateCheck: row?.disableUpdateCheck ?? null,
   confirmTabClose: row?.confirmTabClose ?? null,
   hiddenRailTabs: row?.hiddenRailTabs ?? null,
+  aiAssistantEnabled: row?.aiAssistantEnabled ?? null,
+  aiReadOnlyCommands: row?.aiReadOnlyCommands ?? null,
   compactHostView: row?.compactHostView ?? null,
   statusColorScheme: row?.statusColorScheme ?? null,
+  customThemes: row?.customThemes ?? null,
+  customKeybindings: row?.customKeybindings ?? null,
+  terminalDefaults: row?.terminalDefaults ?? null,
+  rdpDefaults: row?.rdpDefaults ?? null,
+  terminalMacros: row?.terminalMacros ?? null,
 });
+
+const connectionDefaultFields = ["terminalDefaults", "rdpDefaults"] as const;
+
+export function validateDefaultsJson(value: string): boolean {
+  if (value.length > 32_768) return false;
+  try {
+    const parsed = JSON.parse(value);
+    return !!parsed && typeof parsed === "object" && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * @openapi
  * /user-preferences:
  *   get:
  *     summary: Get preferences for the current user
+ *     description: showHostTags, hostTrayOnClick, compactHostView, statusColorScheme and foldersCollapsed are legacy fields, kept here read-only for backward compatibility. The authoritative copy is GET /host-sidebar/preferences.
  *     tags:
  *       - User Preferences
  *     responses:
@@ -104,17 +126,22 @@ const pickPreferences = (row?: typeof userPreferences.$inferSelect) => ({
  *                 statusColorScheme:
  *                   type: string
  *                   nullable: true
+ *                 customThemes:
+ *                   type: string
+ *                   nullable: true
+ *                   description: JSON-encoded array of the user's saved global custom terminal themes.
+ *                 customKeybindings:
+ *                   type: string
+ *                   nullable: true
+ *                   description: JSON-encoded array of the user's custom terminal keybindings.
  */
-router.get("/", authenticateJWT, (req: Request, res: Response) => {
+router.get("/", authenticateJWT, async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).userId;
   try {
-    const rows = db
-      .select()
-      .from(userPreferences)
-      .where(eq(userPreferences.userId, userId))
-      .all();
+    const preferences =
+      await createCurrentUserPreferenceRepository().findByUserId(userId);
 
-    return res.json(pickPreferences(rows[0]));
+    return res.json(pickPreferences(preferences));
   } catch (e) {
     databaseLogger.error("Failed to get user preferences", e, {
       operation: "get_user_preferences",
@@ -129,6 +156,7 @@ router.get("/", authenticateJWT, (req: Request, res: Response) => {
  * /user-preferences:
  *   put:
  *     summary: Update preferences for the current user
+ *     description: showHostTags, hostTrayOnClick, compactHostView, statusColorScheme and foldersCollapsed are no longer accepted here -- they moved to PUT /host-sidebar/preferences as part of the sidebar redesign.
  *     tags:
  *       - User Preferences
  *     requestBody:
@@ -154,15 +182,9 @@ router.get("/", authenticateJWT, (req: Request, res: Response) => {
  *                 type: boolean
  *               commandPaletteEnabled:
  *                 type: boolean
- *               showHostTags:
- *                 type: boolean
- *               hostTrayOnClick:
- *                 type: boolean
  *               pinAppRail:
  *                 type: boolean
  *               expandAppRailOnHover:
- *                 type: boolean
- *               foldersCollapsed:
  *                 type: boolean
  *               confirmSnippetExecution:
  *                 type: boolean
@@ -172,15 +194,17 @@ router.get("/", authenticateJWT, (req: Request, res: Response) => {
  *                 type: boolean
  *               hiddenRailTabs:
  *                 type: string
- *               compactHostView:
- *                 type: boolean
- *               statusColorScheme:
+ *               customThemes:
  *                 type: string
+ *                 description: JSON-encoded array of the user's saved global custom terminal themes.
+ *               customKeybindings:
+ *                 type: string
+ *                 description: JSON-encoded array of the user's custom terminal keybindings.
  *     responses:
  *       200:
  *         description: Preferences updated successfully.
  */
-router.put("/", authenticateJWT, (req: Request, res: Response) => {
+router.put("/", authenticateJWT, async (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).userId;
   const {
     reopenTabsOnLogin,
@@ -191,17 +215,19 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     storageMode,
     commandAutocomplete,
     commandPaletteEnabled,
-    showHostTags,
-    hostTrayOnClick,
     pinAppRail,
     expandAppRailOnHover,
-    foldersCollapsed,
     confirmSnippetExecution,
     disableUpdateCheck,
     confirmTabClose,
     hiddenRailTabs,
-    compactHostView,
-    statusColorScheme,
+    aiAssistantEnabled,
+    aiReadOnlyCommands,
+    customThemes,
+    customKeybindings,
+    terminalDefaults,
+    rdpDefaults,
+    terminalMacros,
   } = req.body as {
     reopenTabsOnLogin?: boolean;
     theme?: string | null;
@@ -211,20 +237,27 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     storageMode?: string | null;
     commandAutocomplete?: boolean | null;
     commandPaletteEnabled?: boolean | null;
-    showHostTags?: boolean | null;
-    hostTrayOnClick?: boolean | null;
     pinAppRail?: boolean | null;
     expandAppRailOnHover?: boolean | null;
-    foldersCollapsed?: boolean | null;
     confirmSnippetExecution?: boolean | null;
     disableUpdateCheck?: boolean | null;
     confirmTabClose?: boolean | null;
     hiddenRailTabs?: string | null;
-    compactHostView?: boolean | null;
-    statusColorScheme?: string | null;
+    aiAssistantEnabled?: boolean | null;
+    aiReadOnlyCommands?: boolean | null;
+    customThemes?: string | null;
+    customKeybindings?: string | null;
+    terminalDefaults?: string | null;
+    rdpDefaults?: string | null;
+    terminalMacros?: string | null;
   };
+  // showHostTags, hostTrayOnClick, compactHostView, statusColorScheme,
+  // foldersCollapsed are no longer writable here -- they moved to
+  // /host-sidebar/preferences as of the sidebar redesign. The columns stay
+  // in the table (read once as a migration seed by that route) but this
+  // endpoint silently ignores them if a stale client still sends them.
 
-  const updates: Partial<typeof userPreferences.$inferInsert> = {
+  const updates: UserPreferenceUpdate = {
     updatedAt: new Date().toISOString(),
   };
 
@@ -244,25 +277,118 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
     language,
     storageMode,
     hiddenRailTabs,
-    statusColorScheme,
+    customThemes,
+    customKeybindings,
+    terminalDefaults,
+    rdpDefaults,
+    terminalMacros,
   })) {
     if (value !== undefined && value !== null && typeof value !== "string") {
       return res.status(400).json({ error: `${key} must be a string` });
     }
   }
 
+  const connectionDefaults = {
+    terminalDefaults,
+    rdpDefaults,
+  };
+  for (const key of connectionDefaultFields) {
+    const value = connectionDefaults[key];
+    if (value !== undefined && value !== null && !validateDefaultsJson(value)) {
+      return res.status(400).json({
+        error: `${key} must be a JSON-encoded object of at most 32 KiB`,
+      });
+    }
+  }
+
+  if (customThemes !== undefined && customThemes !== null) {
+    let parsedThemes: unknown;
+    try {
+      parsedThemes = JSON.parse(customThemes);
+    } catch {
+      return res
+        .status(400)
+        .json({ error: "customThemes must be a JSON-encoded array" });
+    }
+    if (!Array.isArray(parsedThemes) || parsedThemes.length > 100) {
+      return res.status(400).json({
+        error: "customThemes must be a JSON array of at most 100 themes",
+      });
+    }
+    const isValidTheme = (entry: unknown): boolean =>
+      !!entry &&
+      typeof entry === "object" &&
+      typeof (entry as { id?: unknown }).id === "string" &&
+      typeof (entry as { name?: unknown }).name === "string" &&
+      !!(entry as { colors?: unknown }).colors &&
+      typeof (entry as { colors?: unknown }).colors === "object";
+    if (!parsedThemes.every(isValidTheme)) {
+      return res.status(400).json({
+        error: "Each custom theme must have an id, name, and colors object",
+      });
+    }
+  }
+
+  if (customKeybindings !== undefined && customKeybindings !== null) {
+    let parsedKeybindings: unknown;
+    try {
+      parsedKeybindings = JSON.parse(customKeybindings);
+    } catch {
+      return res
+        .status(400)
+        .json({ error: "customKeybindings must be a JSON-encoded array" });
+    }
+    if (!Array.isArray(parsedKeybindings) || parsedKeybindings.length > 200) {
+      return res.status(400).json({
+        error: "customKeybindings must be a JSON array of at most 200 bindings",
+      });
+    }
+    if (!parsedKeybindings.every(isValidKeybinding)) {
+      return res.status(400).json({
+        error:
+          "Each custom keybinding must have an id, enabled flag, valid combo, and valid action",
+      });
+    }
+  }
+
+  if (terminalMacros !== undefined && terminalMacros !== null) {
+    let parsedMacros: unknown;
+    try {
+      parsedMacros = JSON.parse(terminalMacros);
+    } catch {
+      return res
+        .status(400)
+        .json({ error: "terminalMacros must be a JSON-encoded array" });
+    }
+    if (
+      terminalMacros.length > 512 * 1024 ||
+      !Array.isArray(parsedMacros) ||
+      parsedMacros.length > 100 ||
+      !parsedMacros.every(
+        (macro) =>
+          !!macro &&
+          typeof macro === "object" &&
+          typeof (macro as { id?: unknown }).id === "string" &&
+          typeof (macro as { name?: unknown }).name === "string" &&
+          Array.isArray((macro as { steps?: unknown }).steps),
+      )
+    ) {
+      return res.status(400).json({
+        error: "terminalMacros must contain at most 100 valid macros",
+      });
+    }
+  }
+
   const boolFields: Record<string, boolean | null | undefined> = {
     commandAutocomplete,
     commandPaletteEnabled,
-    showHostTags,
-    hostTrayOnClick,
     pinAppRail,
     expandAppRailOnHover,
-    foldersCollapsed,
     confirmSnippetExecution,
     disableUpdateCheck,
     confirmTabClose,
-    compactHostView,
+    aiAssistantEnabled,
+    aiReadOnlyCommands,
   };
   for (const [key, value] of Object.entries(boolFields)) {
     if (value !== undefined && value !== null && typeof value !== "boolean") {
@@ -276,50 +402,36 @@ router.put("/", authenticateJWT, (req: Request, res: Response) => {
   if (language !== undefined) updates.language = language;
   if (storageMode !== undefined) updates.storageMode = storageMode;
   if (hiddenRailTabs !== undefined) updates.hiddenRailTabs = hiddenRailTabs;
+  if (aiAssistantEnabled !== undefined)
+    updates.aiAssistantEnabled = aiAssistantEnabled;
+  if (aiReadOnlyCommands !== undefined)
+    updates.aiReadOnlyCommands = aiReadOnlyCommands;
   if (commandAutocomplete !== undefined)
     updates.commandAutocomplete = commandAutocomplete;
   if (commandPaletteEnabled !== undefined)
     updates.commandPaletteEnabled = commandPaletteEnabled;
-  if (showHostTags !== undefined) updates.showHostTags = showHostTags;
-  if (hostTrayOnClick !== undefined) updates.hostTrayOnClick = hostTrayOnClick;
   if (pinAppRail !== undefined) updates.pinAppRail = pinAppRail;
   if (expandAppRailOnHover !== undefined)
     updates.expandAppRailOnHover = expandAppRailOnHover;
-  if (foldersCollapsed !== undefined)
-    updates.foldersCollapsed = foldersCollapsed;
   if (confirmSnippetExecution !== undefined)
     updates.confirmSnippetExecution = confirmSnippetExecution;
   if (disableUpdateCheck !== undefined)
     updates.disableUpdateCheck = disableUpdateCheck;
   if (confirmTabClose !== undefined) updates.confirmTabClose = confirmTabClose;
-  if (compactHostView !== undefined) updates.compactHostView = compactHostView;
-  if (statusColorScheme !== undefined)
-    updates.statusColorScheme = statusColorScheme;
+  if (customThemes !== undefined) updates.customThemes = customThemes;
+  if (customKeybindings !== undefined)
+    updates.customKeybindings = customKeybindings;
+  if (terminalDefaults !== undefined)
+    updates.terminalDefaults = terminalDefaults;
+  if (rdpDefaults !== undefined) updates.rdpDefaults = rdpDefaults;
+  if (terminalMacros !== undefined) updates.terminalMacros = terminalMacros;
 
   if (Object.keys(updates).length === 1) {
     return res.status(400).json({ error: "No preferences provided" });
   }
 
   try {
-    const existing = db
-      .select()
-      .from(userPreferences)
-      .where(eq(userPreferences.userId, userId))
-      .all();
-
-    if (existing.length === 0) {
-      db.insert(userPreferences)
-        .values({
-          userId,
-          ...updates,
-        })
-        .run();
-    } else {
-      db.update(userPreferences)
-        .set(updates)
-        .where(eq(userPreferences.userId, userId))
-        .run();
-    }
+    await createCurrentUserPreferenceRepository().upsert(userId, updates);
 
     return res.json({ success: true, ...updates });
   } catch (e) {

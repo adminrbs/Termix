@@ -31,11 +31,31 @@ WORKDIR /app
 
 COPY . .
 
-RUN npm rebuild better-sqlite3
+RUN rm -rf node_modules/better-sqlite3/prebuilds && \
+    npm run build-release --prefix node_modules/better-sqlite3 && \
+    test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node
 
 RUN npm run build:backend
 
-# Stage 4: Production dependencies only
+# Stage 4: Download OPKSSH binary for the target platform so the image works offline
+FROM node:24-slim AS opkssh-downloader
+ARG TARGETARCH
+ARG OPKSSH_VERSION=v0.16.0
+WORKDIR /opkssh
+
+RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+RUN case "$TARGETARCH" in \
+      amd64) OPKSSH_ARCH=amd64 ;; \
+      arm64) OPKSSH_ARCH=arm64 ;; \
+      *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
+    esac && \
+    curl -fSL -o "opkssh-linux-${OPKSSH_ARCH}" \
+      "https://github.com/openpubkey/opkssh/releases/download/${OPKSSH_VERSION}/opkssh-linux-${OPKSSH_ARCH}" && \
+    chmod 755 "opkssh-linux-${OPKSSH_ARCH}" && \
+    echo -n "$OPKSSH_VERSION" > version.txt
+
+# Stage 5: Production dependencies only
 FROM node:24-slim AS production-deps
 WORKDIR /app
 
@@ -49,16 +69,20 @@ COPY scripts/patch-guacamole-lite.cjs ./scripts/
 
 RUN npm ci --omit=dev --ignore-scripts && \
     node scripts/patch-guacamole-lite.cjs && \
-    npm rebuild better-sqlite3 bcryptjs ssh2 && \
+    rm -rf node_modules/better-sqlite3/prebuilds && \
+    npm run build-release --prefix node_modules/better-sqlite3 && \
+    test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node && \
+    npm rebuild bcryptjs ssh2 && \
     npm cache clean --force
 
-# Stage 5: Final optimized image
+# Stage 6: Final optimized image
 FROM node:24-slim
 WORKDIR /app
 
 ENV DATA_DIR=/app/data \
     PORT=8080 \
-    NODE_ENV=production
+    NODE_ENV=production \
+    POSTHOG_API_KEY=phc_xM8UznirsFxUkGE68gH4jzeqevf4kh76wGw7Ci7hH2dd
 
 RUN apt-get update && apt-get install -y nginx gettext-base openssl ca-certificates gosu wget certbot python3-certbot-dns-cloudflare && \
     update-ca-certificates && \
@@ -74,7 +98,11 @@ COPY --chown=node:node --from=frontend-builder /app/dist /app/html
 
 COPY --chown=node:node --from=production-deps /app/node_modules /app/node_modules
 COPY --chown=node:node --from=backend-builder /app/dist/backend ./dist/backend
+COPY --chown=node:node --from=opkssh-downloader /opkssh /app/opkssh-bundled
 COPY --chown=node:node package.json ./
+# Schema for Postgres and MySQL. Unused by the default SQLite deployment, which
+# builds its tables at startup instead.
+COPY --chown=node:node drizzle ./drizzle
 
 VOLUME ["/app/data"]
 

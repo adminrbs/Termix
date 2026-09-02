@@ -1,3 +1,4 @@
+import { getErrorMessage } from "../lib/error-message.js";
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/alert.tsx";
 import { useTranslation } from "react-i18next";
@@ -7,6 +8,18 @@ interface ElectronLoginFormProps {
   serverUrl: string;
   onAuthSuccess: (token: string | null) => void | Promise<void>;
   onChangeServer: () => void;
+  // "local" (default): the app's own login, JWT goes to localStorage like
+  // every other client. "remoteSync": this iframe is authenticating a
+  // Settings-triggered connection to a remote Termix server for the sync
+  // engine -- the JWT is handed to the Electron main process's encrypted
+  // store instead, never exposed to the renderer's localStorage.
+  targetPurpose?: "local" | "remoteSync";
+}
+
+interface SaveRemoteSyncJwtResult {
+  success: boolean;
+  reason?: string;
+  error?: string;
 }
 
 const AUTH_MESSAGE_SOURCES = new Set([
@@ -19,6 +32,7 @@ export function ElectronLoginForm({
   serverUrl,
   onAuthSuccess,
   onChangeServer,
+  targetPurpose = "local",
 }: ElectronLoginFormProps) {
   const { t } = useTranslation();
   const [loading, setLoading] = useState(true);
@@ -43,17 +57,40 @@ export function ElectronLoginForm({
 
       try {
         if (token) {
-          localStorage.setItem("jwt", token);
+          if (targetPurpose === "remoteSync") {
+            // The main process refuses to persist the JWT when it has no OS
+            // keyring to encrypt it with, and reports that by resolving with
+            // success: false. Dropping the result signs the user in against a
+            // store that kept nothing, so the next sync tick calls a session
+            // that was never saved expired.
+            const result = (await window.electronAPI?.invoke?.(
+              "save-remote-sync-jwt",
+              token,
+            )) as SaveRemoteSyncJwtResult | undefined;
+            if (!result?.success) {
+              throw new Error(
+                result?.reason === "encryption_unavailable"
+                  ? t("errors.keyringUnavailable")
+                  : result?.error || t("errors.authTokenSaveFailed"),
+              );
+            }
+          } else {
+            localStorage.setItem("jwt", token);
+          }
         }
         await onAuthSuccessRef.current(token);
-      } catch {
-        setError(t("errors.authTokenSaveFailed"));
+      } catch (err) {
+        setError(
+          err instanceof Error && err.message
+            ? err.message
+            : t("errors.authTokenSaveFailed"),
+        );
         isAuthenticatingRef.current = false;
         setIsAuthenticating(false);
         hasAuthenticatedRef.current = false;
       }
     },
-    [t],
+    [t, targetPurpose],
   );
 
   // postMessage from server Auth.tsx after the backend has set the HttpOnly cookie.
@@ -140,8 +177,7 @@ export function ElectronLoginForm({
           typeof event.data.providerId === "number"
             ? event.data.providerId
             : undefined;
-        const error =
-          err instanceof Error ? err.message : t("errors.failedOidcLogin");
+        const error = getErrorMessage(err, t("errors.failedOidcLogin"));
         iframeRef.current?.contentWindow?.postMessage(
           {
             type: "OIDC_SYSTEM_BROWSER_AUTH_RESULT",
@@ -204,7 +240,7 @@ export function ElectronLoginForm({
   const isEmbeddedServer = serverUrl.includes("localhost:30001");
 
   return (
-    <div className="fixed inset-0 w-screen h-screen bg-background flex flex-col">
+    <div className="relative w-full h-full bg-background flex flex-col">
       {isAuthenticating && (
         <div className="absolute inset-0 flex items-center justify-center bg-background z-50">
           <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -212,7 +248,7 @@ export function ElectronLoginForm({
       )}
 
       {!isAuthenticating && (
-        <div className="flex items-center justify-between p-4 bg-background border-b border-border">
+        <div className="flex items-center justify-between p-4 pr-12 bg-background border-b border-border">
           <button
             onClick={onChangeServer}
             className="flex items-center gap-2 text-foreground hover:text-primary transition-colors"

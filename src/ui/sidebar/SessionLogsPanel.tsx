@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useAdaptivePolling } from "@/hooks/use-adaptive-polling";
 import { Input } from "@/components/input";
 import {
   Tooltip,
@@ -14,7 +15,9 @@ import {
   Copy,
   Download,
   Eye,
+  FileText,
   Loader2,
+  Save,
   ScrollText,
   Search,
   X,
@@ -23,9 +26,17 @@ import { toast } from "sonner";
 import {
   getSessionLogs,
   getSessionLogContent,
+  getSessionLogBlob,
+  getSessionRecordingRetention,
+  setSessionRecordingRetention,
   deleteSessionLog,
   type SessionLogRecord,
 } from "@/api/session-log-api";
+import { SessionRecordingPlayer } from "@/features/session-recording/SessionRecordingPlayer";
+import {
+  asciicastToPlainText,
+  parseAsciicast,
+} from "@/features/session-recording/asciicast";
 
 function formatDuration(seconds: number | null): string {
   if (seconds == null) return "--";
@@ -63,7 +74,27 @@ function buildFilename(log: SessionLogRecord): string {
   const h = String(d.getHours()).padStart(2, "0");
   const min = String(d.getMinutes()).padStart(2, "0");
   const s = String(d.getSeconds()).padStart(2, "0");
-  return `${host}_${y}-${m}-${day}_${h}-${min}-${s}.log`;
+  const extension =
+    log.format === "guacamole"
+      ? "guac"
+      : log.format === "asciicast"
+        ? "cast"
+        : "log";
+  return `${host}_${y}-${m}-${day}_${h}-${min}-${s}.${extension}`;
+}
+
+function buildTextFilename(log: SessionLogRecord): string {
+  return buildFilename(log).replace(/\.(cast|guac|log)$/, ".txt");
+}
+
+async function extractPlainText(
+  log: SessionLogRecord,
+  blob: Blob,
+): Promise<string | null> {
+  if (log.format === "guacamole") return null;
+  const source = await blob.text();
+  if (log.format === "text") return source;
+  return asciicastToPlainText(parseAsciicast(source));
 }
 
 function SectionHeader({ label, count }: { label: string; count: number }) {
@@ -83,13 +114,16 @@ function LogRow({
   log,
   onView,
   onDownload,
+  onDownloadText,
   onDelete,
 }: {
   log: SessionLogRecord;
   onView: () => void;
   onDownload: () => void;
+  onDownloadText: () => void;
   onDelete: () => void;
 }) {
+  const { t } = useTranslation();
   const hostLabel = log.hostName ?? log.hostIp ?? `Host ${log.hostId}`;
 
   return (
@@ -104,6 +138,9 @@ function LogRow({
         </span>
         <span className="text-[10px] text-muted-foreground/60 truncate">
           {formatDate(log.startedAt)}
+          {" · "}
+          {(log.protocol ?? "ssh").toUpperCase()}
+          {log.username ? ` · ${log.username}` : ""}
           {" · "}
           {formatDuration(log.duration)}
           {" · "}
@@ -124,6 +161,21 @@ function LogRow({
             </TooltipTrigger>
             <TooltipContent side="left">View log</TooltipContent>
           </Tooltip>
+          {log.format === "asciicast" && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  onClick={onDownloadText}
+                  className="size-6 flex items-center justify-center text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
+                >
+                  <FileText className="size-3" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="left">
+                {t("sessionLogs.downloadAsText")}
+              </TooltipContent>
+            </Tooltip>
+          )}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -159,57 +211,88 @@ export function SessionLogsPanel() {
   const [filter, setFilter] = useState("");
   const [viewLog, setViewLog] = useState<SessionLogRecord | null>(null);
   const [viewContent, setViewContent] = useState<string>("");
+  const [viewBlob, setViewBlob] = useState<Blob | null>(null);
+  const [viewText, setViewText] = useState<string | null>(null);
   const [viewLoading, setViewLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SessionLogRecord | null>(
     null,
   );
   const [deleting, setDeleting] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [retentionDays, setRetentionDays] = useState<number | null>(null);
+  const [savingRetention, setSavingRetention] = useState(false);
+  const logsRef = useRef(logs);
+  logsRef.current = logs;
 
   const load = useCallback(
-    (initial = false) => {
+    async (initial = false) => {
       if (initial) setLoading(true);
-      getSessionLogs()
-        .then((fresh) => {
-          setLogs((prev) => {
-            if (
-              JSON.stringify(prev.map((l) => l.id)) ===
-              JSON.stringify(fresh.map((l) => l.id))
-            )
-              return prev;
-            return fresh;
-          });
-        })
-        .catch(() => {
-          if (initial) toast.error(t("sessionLogs.loadError"));
-        })
-        .finally(() => {
-          if (initial) setLoading(false);
-        });
+      try {
+        const fresh = await getSessionLogs();
+        const changed =
+          logsRef.current.length !== fresh.length ||
+          logsRef.current.some((log, i) => log.id !== fresh[i]?.id);
+        if (changed) {
+          logsRef.current = fresh;
+          setLogs(fresh);
+        }
+        return changed;
+      } catch (error) {
+        if (initial) {
+          toast.error(t("sessionLogs.loadError"));
+          return false;
+        }
+        throw error;
+      } finally {
+        if (initial) setLoading(false);
+      }
     },
     [t],
   );
 
   useEffect(() => {
-    load(true);
-    const interval = setInterval(() => load(false), 5000);
-    return () => clearInterval(interval);
+    void load(true);
+    getSessionRecordingRetention()
+      .then(setRetentionDays)
+      .catch(() => setRetentionDays(null));
   }, [load]);
+
+  useAdaptivePolling(
+    () => load(false),
+    {
+      minIntervalMs: 5_000,
+      maxIntervalMs: 30_000,
+      stablePollsPerStep: 3,
+    },
+    true,
+    { runImmediately: false },
+  );
 
   const q = filter.trim().toLowerCase();
   const filtered = q
     ? logs.filter((l) =>
-        (l.hostName ?? l.hostIp ?? "").toLowerCase().includes(q),
+        `${l.hostName ?? ""} ${l.hostIp ?? ""} ${l.username ?? ""} ${l.protocol}`
+          .toLowerCase()
+          .includes(q),
       )
     : logs;
 
   const handleView = async (log: SessionLogRecord) => {
     setViewLog(log);
     setViewContent("");
+    setViewBlob(null);
+    setViewText(null);
     setViewLoading(true);
     try {
-      const content = await getSessionLogContent(log.id);
-      setViewContent(content);
+      if (log.format === "text") {
+        const text = await getSessionLogContent(log.id);
+        setViewContent(text);
+        setViewText(text);
+      } else {
+        const blob = await getSessionLogBlob(log.id);
+        setViewBlob(blob);
+        setViewText(await extractPlainText(log, blob));
+      }
     } catch {
       toast.error(t("sessionLogs.loadError"));
     } finally {
@@ -217,16 +300,37 @@ export function SessionLogsPanel() {
     }
   };
 
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handleDownload = async (log: SessionLogRecord) => {
     try {
-      const content = await getSessionLogContent(log.id);
-      const blob = new Blob([content], { type: "text/plain" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = buildFilename(log);
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadBlob(await getSessionLogBlob(log.id), buildFilename(log));
+    } catch {
+      toast.error(t("sessionLogs.loadError"));
+    }
+  };
+
+  const handleDownloadText = async (log: SessionLogRecord) => {
+    try {
+      const text =
+        log.id === viewLog?.id && viewText != null
+          ? viewText
+          : await extractPlainText(log, await getSessionLogBlob(log.id));
+      if (text == null) {
+        toast.error(t("sessionLogs.loadError"));
+        return;
+      }
+      downloadBlob(
+        new Blob([text], { type: "text/plain" }),
+        buildTextFilename(log),
+      );
     } catch {
       toast.error(t("sessionLogs.loadError"));
     }
@@ -247,8 +351,8 @@ export function SessionLogsPanel() {
   };
 
   const handleCopy = async () => {
-    if (!viewContent) return;
-    const ok = await copyToClipboard(viewContent);
+    if (!viewText) return;
+    const ok = await copyToClipboard(viewText);
     if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
@@ -285,6 +389,7 @@ export function SessionLogsPanel() {
             </span>
             <span className="text-[10px] text-muted-foreground/50">
               {formatDate(viewLog.startedAt)}
+              {` · ${viewLog.protocol.toUpperCase()}`}
               {viewLog.duration != null
                 ? ` · ${formatDuration(viewLog.duration)}`
                 : ""}
@@ -294,25 +399,42 @@ export function SessionLogsPanel() {
           </div>
           <TooltipProvider>
             <div className="flex items-center gap-0.5 shrink-0">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    onClick={handleCopy}
-                    className="size-6 flex items-center justify-center text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
-                  >
-                    {copied ? (
-                      <Check className="size-3 text-green-500" />
-                    ) : (
-                      <Copy className="size-3" />
-                    )}
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="left">
-                  {copied
-                    ? t("sessionLogs.copied")
-                    : t("sessionLogs.copyContent")}
-                </TooltipContent>
-              </Tooltip>
+              {viewText != null && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      onClick={handleCopy}
+                      className="size-6 flex items-center justify-center text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
+                    >
+                      {copied ? (
+                        <Check className="size-3 text-green-500" />
+                      ) : (
+                        <Copy className="size-3" />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    {copied
+                      ? t("sessionLogs.copied")
+                      : t("sessionLogs.copyContent")}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              {viewLog.format === "asciicast" && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      onClick={() => handleDownloadText(viewLog)}
+                      className="size-6 flex items-center justify-center text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
+                    >
+                      <FileText className="size-3" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    {t("sessionLogs.downloadAsText")}
+                  </TooltipContent>
+                </Tooltip>
+              )}
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
@@ -336,6 +458,8 @@ export function SessionLogsPanel() {
             <div className="flex items-center justify-center py-16">
               <Loader2 className="size-4 animate-spin text-muted-foreground" />
             </div>
+          ) : viewBlob ? (
+            <SessionRecordingPlayer log={viewLog} blob={viewBlob} />
           ) : (
             <pre className="p-3 text-[11px] font-mono whitespace-pre-wrap break-all text-foreground/80 leading-relaxed">
               {viewContent || "(empty)"}
@@ -349,6 +473,44 @@ export function SessionLogsPanel() {
   return (
     <div className="flex flex-col flex-1 min-h-0">
       <div className="flex-1 overflow-y-auto">
+        {retentionDays != null && (
+          <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2 text-[10px] text-muted-foreground">
+            <span className="flex-1">Recording retention</span>
+            <Input
+              type="number"
+              min={1}
+              max={3650}
+              value={retentionDays}
+              onChange={(event) => setRetentionDays(Number(event.target.value))}
+              className="h-7 w-20 text-xs"
+              aria-label="Recording retention days"
+            />
+            <span>days</span>
+            <button
+              type="button"
+              disabled={savingRetention}
+              onClick={async () => {
+                setSavingRetention(true);
+                try {
+                  await setSessionRecordingRetention(retentionDays);
+                  toast.success("Recording retention updated");
+                } catch {
+                  toast.error("Failed to update recording retention");
+                } finally {
+                  setSavingRetention(false);
+                }
+              }}
+              className="flex size-7 items-center justify-center hover:bg-muted disabled:opacity-50"
+              aria-label="Save recording retention"
+            >
+              {savingRetention ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <Save className="size-3" />
+              )}
+            </button>
+          </div>
+        )}
         {logs.length === 0 ? (
           <div className="flex flex-col items-center justify-center flex-1 gap-3 p-6 text-center py-16">
             <div className="size-10 bg-muted/40 flex items-center justify-center">
@@ -393,6 +555,7 @@ export function SessionLogsPanel() {
                     log={log}
                     onView={() => handleView(log)}
                     onDownload={() => handleDownload(log)}
+                    onDownloadText={() => handleDownloadText(log)}
                     onDelete={() => setDeleteTarget(log)}
                   />
                 ))}

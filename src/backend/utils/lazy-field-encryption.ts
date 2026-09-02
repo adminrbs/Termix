@@ -1,13 +1,7 @@
+import { getErrorMessage } from "./error-message.js";
 import { FieldCrypto } from "./field-crypto.js";
 import { databaseLogger } from "./logger.js";
-
-interface DatabaseInstance {
-  prepare: (sql: string) => {
-    all: (param?: unknown) => unknown[];
-    get: (param?: unknown) => unknown;
-    run: (...params: unknown[]) => unknown;
-  };
-}
+import type { UserEncryptionMigrationStore } from "./user-encryption-migration-store.js";
 
 export class LazyFieldEncryption {
   private static readonly LEGACY_FIELD_NAME_MAP: Record<string, string> = {
@@ -152,7 +146,7 @@ export class LazyFieldEncryption {
           operation: "lazy_encryption_decrypt_failed",
           recordId,
           fieldName,
-          error: error instanceof Error ? error.message : "Unknown error",
+          error: getErrorMessage(error),
         });
         throw error;
       }
@@ -188,7 +182,7 @@ export class LazyFieldEncryption {
           operation: "lazy_encryption_migrate_failed",
           recordId,
           fieldName,
-          error: error instanceof Error ? error.message : "Unknown error",
+          error: getErrorMessage(error),
         });
         throw error;
       }
@@ -367,7 +361,7 @@ export class LazyFieldEncryption {
   static async checkUserNeedsMigration(
     userId: string,
     userKEK: Buffer,
-    db: DatabaseInstance,
+    store: UserEncryptionMigrationStore,
   ): Promise<{
     needsMigration: boolean;
     plaintextFields: Array<{
@@ -384,11 +378,7 @@ export class LazyFieldEncryption {
     let needsMigration = false;
 
     try {
-      const sshHosts = db
-        .prepare("SELECT * FROM ssh_data WHERE user_id = ?")
-        .all(userId) as Array<
-        Record<string, unknown> & { id: string | number }
-      >;
+      const sshHosts = store.listHostRecords(userId);
       for (const host of sshHosts) {
         const sensitiveFields = this.getSensitiveFieldsForTable("ssh_data");
         const hostPlaintextFields: string[] = [];
@@ -418,11 +408,7 @@ export class LazyFieldEncryption {
         }
       }
 
-      const sshCredentials = db
-        .prepare("SELECT * FROM ssh_credentials WHERE user_id = ?")
-        .all(userId) as Array<
-        Record<string, unknown> & { id: string | number }
-      >;
+      const sshCredentials = store.listCredentialRecords(userId);
       for (const credential of sshCredentials) {
         const sensitiveFields =
           this.getSensitiveFieldsForTable("ssh_credentials");
@@ -453,16 +439,18 @@ export class LazyFieldEncryption {
         }
       }
 
-      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+      const user = store.getUserRecord(userId);
       if (user) {
         const sensitiveFields = this.getSensitiveFieldsForTable("users");
         const userPlaintextFields: string[] = [];
 
         for (const field of sensitiveFields) {
           const column = this.propertyToColumn(field);
+          const value = user[column];
           if (
-            user[column] &&
-            this.fieldNeedsMigration(user[column], userKEK, userId, field)
+            typeof value === "string" &&
+            value &&
+            this.fieldNeedsMigration(value, userKEK, userId, field)
           ) {
             userPlaintextFields.push(field);
             needsMigration = true;
@@ -483,7 +471,7 @@ export class LazyFieldEncryption {
       databaseLogger.error("Failed to check user migration needs", error, {
         operation: "lazy_encryption_user_check_failed",
         userId,
-        error: error instanceof Error ? error.message : "Unknown error",
+        error: getErrorMessage(error),
       });
 
       return { needsMigration: false, plaintextFields: [] };

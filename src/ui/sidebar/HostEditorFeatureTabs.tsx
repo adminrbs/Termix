@@ -105,7 +105,22 @@ export function HostProxmoxTab({
     windowsPatterns: "win, windows",
     dockerPatterns: "docker",
     preferredPrefixes: "10., 192.168.",
+    autoSyncEnabled: false,
+    syncIntervalMinutes: 15,
+    markMissingGuests: true,
   };
+  const lastSyncResult = cfg.lastSyncResult;
+  const lastSyncSummary = lastSyncResult
+    ? t("hosts.proxmoxLastSyncSummary", {
+        created: lastSyncResult.created,
+        updated: lastSyncResult.updated,
+        markedMissing: lastSyncResult.markedMissing,
+        skipped: lastSyncResult.skipped,
+      })
+    : t("hosts.proxmoxLastSyncNoResult");
+  const lastSyncDescription = cfg.lastSyncAt
+    ? `${new Date(cfg.lastSyncAt).toLocaleString()} · ${lastSyncSummary}`
+    : t("hosts.proxmoxLastSyncNever");
 
   return (
     <SectionCard
@@ -229,6 +244,120 @@ export function HostProxmoxTab({
                   })
                 }
                 placeholder="10., 192.168."
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("hosts.proxmoxAutoSync")}
+              description={t("hosts.proxmoxAutoSyncDesc")}
+            >
+              <FakeSwitch
+                checked={cfg.autoSyncEnabled === true}
+                onChange={(v) =>
+                  setField("proxmoxConfig", {
+                    ...cfg,
+                    autoSyncEnabled: v,
+                  })
+                }
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("hosts.proxmoxSyncInterval")}
+              description={t("hosts.proxmoxSyncIntervalDesc")}
+            >
+              <Input
+                className="w-24 h-7 text-xs"
+                type="number"
+                min={5}
+                value={cfg.syncIntervalMinutes ?? 15}
+                onChange={(e) =>
+                  setField("proxmoxConfig", {
+                    ...cfg,
+                    syncIntervalMinutes: Math.max(
+                      5,
+                      Number.parseInt(e.target.value || "15", 10),
+                    ),
+                  })
+                }
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("hosts.proxmoxMarkMissing")}
+              description={t("hosts.proxmoxMarkMissingDesc")}
+            >
+              <FakeSwitch
+                checked={cfg.markMissingGuests !== false}
+                onChange={(v) =>
+                  setField("proxmoxConfig", {
+                    ...cfg,
+                    markMissingGuests: v,
+                  })
+                }
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("hosts.proxmoxLastSync")}
+              description={lastSyncDescription}
+            >
+              <span
+                className={`text-xs ${
+                  cfg.lastSyncStatus === "error"
+                    ? "text-destructive"
+                    : "text-muted-foreground"
+                }`}
+                title={cfg.lastSyncError ?? undefined}
+              >
+                {cfg.lastSyncStatus
+                  ? t(`hosts.proxmoxLastSyncStatus.${cfg.lastSyncStatus}`)
+                  : t("hosts.proxmoxLastSyncStatus.pending")}
+              </span>
+            </SettingRow>
+          </>
+        )}
+        <SettingRow
+          label={t("hosts.enableProxmoxStats")}
+          description={t("hosts.enableProxmoxStatsDesc")}
+        >
+          <FakeSwitch
+            checked={form.enableProxmoxStats}
+            onChange={(v) => setField("enableProxmoxStats", v)}
+          />
+        </SettingRow>
+        {form.enableProxmoxStats && (
+          <>
+            <SettingRow
+              label={t("hosts.proxmoxStatsPollInterval")}
+              description={t("hosts.proxmoxStatsPollIntervalDesc")}
+            >
+              <Input
+                className="w-24 h-7 text-xs"
+                type="number"
+                min={15}
+                value={form.proxmoxStatsConfig?.pollInterval ?? 60}
+                onChange={(e) =>
+                  setField("proxmoxStatsConfig", {
+                    ...form.proxmoxStatsConfig,
+                    pollInterval: Math.max(
+                      15,
+                      Number.parseInt(e.target.value || "60", 10),
+                    ),
+                  })
+                }
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("hosts.proxmoxStatsNodeOverride")}
+              description={t("hosts.proxmoxStatsNodeOverrideDesc")}
+            >
+              <Input
+                className="w-44 h-7 text-xs"
+                value={form.proxmoxStatsConfig?.nodeName ?? ""}
+                placeholder={t("hosts.proxmoxStatsNodeOverridePlaceholder")}
+                onChange={(e) =>
+                  setField("proxmoxStatsConfig", {
+                    ...form.proxmoxStatsConfig,
+                    nodeName: e.target.value || null,
+                  })
+                }
               />
             </SettingRow>
           </>

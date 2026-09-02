@@ -62,6 +62,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { useTabsSafe } from "@/shell/TabContext";
 import { cn } from "@/lib/utils";
+import { readStatusColorScheme } from "@/hooks/use-status-color-scheme";
 
 const AVAILABLE_COLORS = [
   { value: "#ef4444", label: "Red" },
@@ -92,6 +93,8 @@ interface NetworkGraphCardProps {
   rightSidebarWidth?: number;
   embedded?: boolean;
   onOpenInNewTab?: () => void;
+  /** When false, pause status refresh while the surface stays mounted. */
+  isVisible?: boolean;
 }
 
 type NetworkElement = NetworkTopologyNode | NetworkTopologyEdge;
@@ -128,12 +131,14 @@ function buildNodeSvg(
 ): string {
   const isOnline = status === "online";
   const isOffline = status === "offline";
-  const useRealColors = localStorage.getItem("statusColorScheme") === "status";
+  const useRealColors = readStatusColorScheme() === "status";
   let statusColor: string;
   if (isOnline) {
     statusColor = useRealColors
       ? "rgb(16,185,129)"
       : resolveCssVar("--accent-brand", "rgb(16,185,129)");
+  } else if (status === "reachable") {
+    statusColor = "rgb(251,191,36)";
   } else if (isOffline) {
     statusColor = useRealColors ? "rgb(239,68,68)" : "rgba(16,185,129,0.2)";
   } else {
@@ -195,6 +200,7 @@ function buildNodeSvg(
 export function NetworkGraphCard({
   embedded = true,
   onOpenInNewTab,
+  isVisible = true,
 }: NetworkGraphCardProps): React.ReactElement {
   const { t } = useTranslation();
   const { addTab } = useTabsSafe();
@@ -269,8 +275,19 @@ export function NetworkGraphCard({
   }, [hostMap]);
 
   useEffect(() => {
+    if (!isVisible) {
+      if (statusIntervalRef.current) {
+        clearInterval(statusIntervalRef.current);
+        statusIntervalRef.current = null;
+      }
+      return;
+    }
+
     loadData();
-    statusIntervalRef.current = setInterval(updateHostStatuses, 30000);
+    statusIntervalRef.current = setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      updateHostStatuses();
+    }, 30000);
     const onClickOutside = (e: MouseEvent) => {
       if (
         contextMenuRef.current &&
@@ -293,7 +310,7 @@ export function NetworkGraphCard({
       document.removeEventListener("mousedown", onClickOutside, true);
       themeObserver.disconnect();
     };
-  }, []);
+  }, [isVisible]);
 
   const loadData = async () => {
     setLoading(true);
@@ -481,9 +498,13 @@ export function NetworkGraphCard({
     (cy: cytoscape.Core) => {
       cyRef.current = cy;
       if (embedded) {
-        cy.nodes().forEach((n) => n.ungrabify());
+        cy.nodes().forEach((n) => {
+          n.ungrabify();
+        });
       } else {
-        cy.nodes().forEach((n) => n.grabify());
+        cy.nodes().forEach((n) => {
+          n.grabify();
+        });
       }
       applyStyle(cy);
 

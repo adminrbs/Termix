@@ -1,4 +1,7 @@
 import { authApi } from "@/main-axios";
+import { createTtlRequestCache } from "@/lib/ttl-request-cache";
+import type { TerminalTheme } from "@/lib/terminal-themes";
+import type { CustomKeybinding } from "@/types/keybindings";
 
 // OPEN TABS API
 // ============================================================================
@@ -40,7 +43,13 @@ export interface ActiveSessionInfo {
   tabInstanceId: string | null;
   isConnected: boolean;
   createdAt: number;
+  isOwnSession: boolean;
+  sharedByUsername: string | null;
+  permissionLevel: string | null;
+  shareId: string | null;
 }
+
+const activeSessionsCache = createTtlRequestCache<ActiveSessionInfo[]>(2_000);
 
 export async function getOpenTabs(): Promise<OpenTabRecord[]> {
   const response = await authApi.get("/open-tabs");
@@ -58,7 +67,7 @@ export async function deleteOpenTab(instanceId: string): Promise<void> {
 export async function patchOpenTab(
   instanceId: string,
   updates: Partial<
-    Pick<OpenTabRecord, "label" | "tabOrder" | "backendSessionId">
+    Pick<OpenTabRecord, "hostId" | "label" | "tabOrder" | "backendSessionId">
   >,
 ): Promise<void> {
   await authApi.patch(`/open-tabs/${instanceId}`, updates);
@@ -69,13 +78,21 @@ export async function addOpenTab(tab: OpenTabUpsertPayload): Promise<void> {
 }
 
 export async function getActiveSessions(): Promise<ActiveSessionInfo[]> {
-  const response = await authApi.get("/open-tabs/active-sessions");
-  return response.data;
+  return activeSessionsCache.get(async () => {
+    const response = await authApi.get("/open-tabs/active-sessions");
+    return Array.isArray(response.data) ? response.data : [];
+  });
 }
 
 // ============================================================================
 // USER PREFERENCES API
 // ============================================================================
+
+export interface SavedCustomTheme {
+  id: string;
+  name: string;
+  colors: TerminalTheme["colors"];
+}
 
 export interface UserPreferences {
   reopenTabsOnLogin: boolean;
@@ -95,8 +112,37 @@ export interface UserPreferences {
   disableUpdateCheck?: boolean | null;
   confirmTabClose?: boolean | null;
   hiddenRailTabs?: string | null;
+  aiAssistantEnabled?: boolean | null;
+  aiReadOnlyCommands?: boolean | null;
   compactHostView?: boolean | null;
   statusColorScheme?: string | null;
+  customThemes?: string | null;
+  customKeybindings?: string | null;
+  terminalDefaults?: string | null;
+  rdpDefaults?: string | null;
+  terminalMacros?: string | null;
+}
+
+export function parseCustomThemes(raw?: string | null): SavedCustomTheme[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function parseCustomKeybindings(
+  raw?: string | null,
+): CustomKeybinding[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function getUserPreferences(): Promise<UserPreferences> {

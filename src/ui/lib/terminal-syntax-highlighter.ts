@@ -61,6 +61,8 @@ const MAX_LINE_LENGTH = 2000;
 // (mc, nano, vim, htop). If a chunk contains these, highlighting can inject
 // extra SGR bytes into a full-screen redraw and corrupt xterm's cursor state.
 const TUI_SEQUENCE = /\x1b\[(?:[\d;]*[ABCDEFGHJKST]|\?[\d;]*[hl])/;
+const TUI_FRAME_SEQUENCE = /[\u2500-\u257f]|\x1b[()][0B]|\x1b\[[0-9;]*[~`]/;
+const CONTROL_STRING_SEQUENCE = /\x1b[\]P^_]/;
 
 // A bare \r (not immediately followed by \n) means the terminal is overwriting
 // the current line (shell prompts, progress bars). Highlighting mid-rewrite
@@ -70,7 +72,13 @@ const MID_LINE_CR = /\r(?!\n)/;
 // Detects shell prompt lines (user@host:/path$ or similar) after stripping ANSI.
 // These should not be highlighted — the server already colored them, and injecting
 // additional ANSI codes into the prompt fragments causes display corruption.
-const STRIP_ANSI_RE = /\x1b(?:[@-Z\\-_]|\[[0-9;?>=!]*[@-~])/g;
+//
+// The parameter-byte class (0-9;?>=!) intentionally also includes `<` and `:` —
+// SGR mouse-tracking reports (`ESC[<Cb;Cx;CyM`) use `<` as their private-mode
+// marker. Without it, mouse reports from TUI apps (especially through a
+// multiplexer like screen) aren't recognized as escape sequences and leak
+// through as literal "35;191;1M" text on screen.
+const STRIP_ANSI_RE = /\x1b(?:[@-Z\\-_]|\[[0-9:;<=>?!]*[@-~])/g;
 const SSH_BRACKET_HEADING_RE =
   /(?:(?<=^)|(?<=\s))\[[\w.-]+@[\w.-]+(?:[^\]\r\n]*)?\]/g;
 
@@ -87,7 +95,7 @@ function isShellPromptLine(bare: string): boolean {
 }
 
 // Matches any complete ANSI escape sequence
-const ANSI_REGEX = /\x1b(?:[@-Z\\-_]|\[[0-9;?>=!]*[@-~])/g;
+const ANSI_REGEX = /\x1b(?:[@-Z\\-_]|\[[0-9:;<=>?!]*[@-~])/g;
 
 // Matches SGR sequences (color/style setters) specifically — used to track active color state
 const SGR_REGEX = /\x1b\[[0-9;]*m/;
@@ -216,7 +224,56 @@ const ALL_PATTERNS: HighlightPattern[] = [
 ];
 
 function hasIncompleteAnsiSequence(text: string): boolean {
-  return /\x1b\[[0-9;?>=!]*$/.test(text);
+  return /\x1b\[[0-9:;<=>?!]*$/.test(text);
+}
+
+/**
+ * Tracks whether the stream is inside a control string (OSC/DCS/APC/PM) across
+ * chunk boundaries.
+ *
+ * A control string carries text that must never reach the screen — an OSC 0
+ * title, for instance, contains the user, host and path. Its opening `ESC ]`
+ * and its terminator often land in different websocket frames, and the
+ * continuation frame contains no escape byte at all, so every single-chunk
+ * guard here misses it. Highlighting that continuation injects an SGR sequence
+ * into the middle of the string, which aborts it early in xterm.js and dumps
+ * the rest of the payload on screen as ordinary text.
+ *
+ * A trailing lone ESC counts as active for the same reason: its intent is only
+ * knowable from the next chunk.
+ */
+export function updateControlStringMode(
+  output: string,
+  currentMode: boolean,
+): { isActive: boolean; wasActive: boolean } {
+  const wasActive = currentMode;
+  let isActive = currentMode;
+
+  for (let i = 0; i < output.length; i++) {
+    const char = output[i];
+
+    if (isActive) {
+      if (char === "\x07") {
+        isActive = false;
+      } else if (char === "\x1b") {
+        // ST (ESC \) closes it; any other ESC aborts it.
+        isActive = false;
+        if (output[i + 1] === "\\") i++;
+      }
+      continue;
+    }
+
+    if (char !== "\x1b") continue;
+
+    const next = output[i + 1];
+    if (next === undefined) return { isActive: true, wasActive };
+    if (next === "]" || next === "P" || next === "^" || next === "_") {
+      isActive = true;
+      i++;
+    }
+  }
+
+  return { isActive, wasActive };
 }
 
 function parseAnsiSegments(text: string): TextSegment[] {
@@ -254,11 +311,11 @@ function highlightPlainText(
   text: string,
   activePatterns: HighlightPattern[],
   activeSgr: string,
+  protectedRanges: ProtectedRange[],
 ): string {
   if (text.length > MAX_LINE_LENGTH || !text.trim()) return text;
 
   const matches: MatchResult[] = [];
-  const protectedRanges = getProtectedRanges(text);
 
   for (const pattern of activePatterns) {
     pattern.regex.lastIndex = 0;
@@ -376,15 +433,37 @@ function highlightLine(
   const bare = cr ? line.slice(0, -1) : line;
 
   if (!bare.trim()) return line;
+  if (bare.length > MAX_LINE_LENGTH) return line;
   if (isShellPromptLine(bare)) return line;
 
+  // Compute protected ranges (e.g. SSH bracket headings) against the fully
+  // stripped line rather than per-ANSI-segment text. A colored prompt theme
+  // (e.g. "[<color>user<reset>@<color>host<reset>]") splits the heading across
+  // multiple plain-text segments, so matching per-segment would miss it and
+  // let a username like "warning" get wrongly highlighted as a log level.
+  const plainLine = bare.replace(STRIP_ANSI_RE, "");
+  const lineProtectedRanges = getProtectedRanges(plainLine);
+
   const segments = parseAnsiSegments(bare);
+  let plainOffset = 0;
   const result = segments
-    .map((s) =>
-      s.isAnsi
-        ? s.content
-        : highlightPlainText(s.content, activePatterns, s.activeSgr ?? ""),
-    )
+    .map((s) => {
+      if (s.isAnsi) return s.content;
+      const segmentStart = plainOffset;
+      plainOffset += s.content.length;
+      const localRanges = lineProtectedRanges
+        .map((r) => ({
+          start: r.start - segmentStart,
+          end: r.end - segmentStart,
+        }))
+        .filter((r) => r.start < s.content.length && r.end > 0);
+      return highlightPlainText(
+        s.content,
+        activePatterns,
+        s.activeSgr ?? "",
+        localRanges,
+      );
+    })
     .join("");
 
   return cr ? result + "\r" : result;
@@ -398,6 +477,8 @@ export function highlightTerminalOutput(
   if (hasIncompleteAnsiSequence(text)) return text;
 
   if (TUI_SEQUENCE.test(text)) return text;
+  if (TUI_FRAME_SEQUENCE.test(text)) return text;
+  if (CONTROL_STRING_SEQUENCE.test(text)) return text;
   if (MID_LINE_CR.test(text)) return text;
 
   const activePatterns = buildActivePatterns(options);

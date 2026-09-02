@@ -5,13 +5,6 @@ import { Input } from "@/components/input";
 import { PasswordInput } from "@/components/password-input";
 import { SettingRow } from "@/components/section-card";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/select";
-import {
   Database,
   Lock,
   Pencil,
@@ -30,6 +23,15 @@ import type { AcmeSettings, AcmeChallengeType } from "@/api/acme-ssl-api";
 type GeneralSettingsSectionProps = {
   open: boolean;
   onToggle: () => void;
+  analyticsEnabled: boolean;
+  analyticsLocked: boolean;
+  handleToggleAnalytics: () => void;
+  sessionSharingGloballyEnabled: boolean;
+  aiGloballyEnabled: boolean;
+  onToggleAiGloballyEnabled: () => void;
+  aiPrivateEndpoints: string[];
+  onSaveAiPrivateEndpoints: (hosts: string[]) => void;
+  handleToggleSessionSharingGloballyEnabled: () => void;
   allowRegistration: boolean;
   handleToggleRegistration: () => void;
   allowPasswordLogin: boolean;
@@ -37,6 +39,7 @@ type GeneralSettingsSectionProps = {
   oidcAutoProvision: boolean;
   handleToggleOidcAutoProvision: () => void;
   oidcSilentLoginDefault: boolean;
+  oidcSilentLoginDefaultLocked: boolean;
   handleToggleOidcSilentLoginDefault: () => void;
   allowPasswordReset: boolean;
   handleTogglePasswordReset: () => void;
@@ -61,12 +64,23 @@ type GeneralSettingsSectionProps = {
   handleSaveLogLevel: (level: string) => void;
   tailscaleApiKey: string;
   setTailscaleApiKey: Dispatch<SetStateAction<string>>;
+  tailscaleApiBaseUrl: string;
+  setTailscaleApiBaseUrl: Dispatch<SetStateAction<string>>;
   handleSaveTailscaleApiKey: () => void;
 };
 
 export function AdminGeneralSettingsSection({
   open,
   onToggle,
+  analyticsEnabled,
+  analyticsLocked,
+  handleToggleAnalytics,
+  sessionSharingGloballyEnabled,
+  aiGloballyEnabled,
+  onToggleAiGloballyEnabled,
+  aiPrivateEndpoints,
+  onSaveAiPrivateEndpoints,
+  handleToggleSessionSharingGloballyEnabled,
   allowRegistration,
   handleToggleRegistration,
   allowPasswordLogin,
@@ -74,6 +88,7 @@ export function AdminGeneralSettingsSection({
   oidcAutoProvision,
   handleToggleOidcAutoProvision,
   oidcSilentLoginDefault,
+  oidcSilentLoginDefaultLocked,
   handleToggleOidcSilentLoginDefault,
   allowPasswordReset,
   handleTogglePasswordReset,
@@ -98,6 +113,8 @@ export function AdminGeneralSettingsSection({
   handleSaveLogLevel,
   tailscaleApiKey,
   setTailscaleApiKey,
+  tailscaleApiBaseUrl,
+  setTailscaleApiBaseUrl,
   handleSaveTailscaleApiKey,
 }: GeneralSettingsSectionProps) {
   const { t } = useTranslation();
@@ -110,6 +127,63 @@ export function AdminGeneralSettingsSection({
       onToggle={onToggle}
     >
       <div className="flex flex-col gap-0 pt-2">
+        <SettingRow
+          label={t("admin.analyticsEnabled")}
+          description={
+            analyticsLocked
+              ? t("admin.analyticsEnabledLockedDesc")
+              : t("admin.analyticsEnabledDesc")
+          }
+        >
+          <AdminToggle
+            on={analyticsEnabled}
+            onToggle={handleToggleAnalytics}
+            disabled={analyticsLocked}
+          />
+        </SettingRow>
+        <SettingRow
+          label={t("admin.sessionSharingGloballyEnabled")}
+          description={t("admin.sessionSharingGloballyEnabledDesc")}
+        >
+          <AdminToggle
+            on={sessionSharingGloballyEnabled}
+            onToggle={handleToggleSessionSharingGloballyEnabled}
+          />
+        </SettingRow>
+        <SettingRow
+          label={t("admin.aiGloballyEnabled")}
+          description={t("admin.aiGloballyEnabledDesc")}
+        >
+          <AdminToggle
+            on={aiGloballyEnabled}
+            onToggle={onToggleAiGloballyEnabled}
+          />
+        </SettingRow>
+        {aiGloballyEnabled && (
+          // Full-width rather than a SettingRow: the panel is narrow, and an
+          // inline field here squeezes the label down to a word per line.
+          <div className="flex flex-col gap-1.5 py-2">
+            <span className="text-xs font-medium">
+              {t("admin.aiPrivateEndpoints")}
+            </span>
+            <span className="text-[11px] leading-snug text-muted-foreground">
+              {t("admin.aiPrivateEndpointsDesc")}
+            </span>
+            <Input
+              className="rounded-none"
+              defaultValue={aiPrivateEndpoints.join(", ")}
+              placeholder="localhost, 127.0.0.1"
+              onBlur={(event) =>
+                onSaveAiPrivateEndpoints(
+                  event.target.value
+                    .split(",")
+                    .map((entry) => entry.trim())
+                    .filter(Boolean),
+                )
+              }
+            />
+          </div>
+        )}
         <SettingRow
           label={t("admin.allowRegistration")}
           description={t("admin.allowRegistrationDesc")}
@@ -139,11 +213,16 @@ export function AdminGeneralSettingsSection({
         </SettingRow>
         <SettingRow
           label={t("admin.oidcSilentLoginDefault")}
-          description={t("admin.oidcSilentLoginDefaultDesc")}
+          description={
+            oidcSilentLoginDefaultLocked
+              ? t("admin.oidcSilentLoginDefaultLockedDesc")
+              : t("admin.oidcSilentLoginDefaultDesc")
+          }
         >
           <AdminToggle
             on={oidcSilentLoginDefault}
             onToggle={handleToggleOidcSilentLoginDefault}
+            disabled={oidcSilentLoginDefaultLocked}
           />
         </SettingRow>
         <SettingRow
@@ -336,7 +415,7 @@ export function AdminGeneralSettingsSection({
               type="password"
               value={tailscaleApiKey}
               onChange={(e) => setTailscaleApiKey(e.target.value)}
-              placeholder="tskey-api-..."
+              placeholder="tskey-api-... / hskey-api-..."
               className="text-sm"
             />
             <Button
@@ -347,6 +426,20 @@ export function AdminGeneralSettingsSection({
             >
               {t("common.save")}
             </Button>
+          </div>
+          <div className="flex flex-col gap-1.5 mt-1">
+            <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
+              {t("admin.tailscaleApiBaseUrl")}
+            </label>
+            <span className="text-[10px] text-muted-foreground">
+              {t("admin.tailscaleApiBaseUrlDescription")}
+            </span>
+            <Input
+              value={tailscaleApiBaseUrl}
+              onChange={(e) => setTailscaleApiBaseUrl(e.target.value)}
+              placeholder="https://api.tailscale.com/api/v2"
+              className="text-sm"
+            />
           </div>
         </div>
 
@@ -1038,6 +1131,12 @@ type AdminSSLSectionProps = {
   requesting: boolean;
   handleSave: () => void;
   handleRequest: () => void;
+  manualCertDraft: string;
+  setManualCertDraft: Dispatch<SetStateAction<string>>;
+  manualKeyDraft: string;
+  setManualKeyDraft: Dispatch<SetStateAction<string>>;
+  manualUploading: boolean;
+  handleManualUpload: () => void;
 };
 
 export function AdminSSLSection({
@@ -1050,6 +1149,12 @@ export function AdminSSLSection({
   requesting,
   handleSave,
   handleRequest,
+  manualCertDraft,
+  setManualCertDraft,
+  manualKeyDraft,
+  setManualKeyDraft,
+  manualUploading,
+  handleManualUpload,
 }: AdminSSLSectionProps) {
   const { t } = useTranslation();
 
@@ -1109,61 +1214,58 @@ export function AdminSSLSection({
 
         <div className="flex flex-col gap-1">
           <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
-            {t("admin.sslDomain")}
-          </label>
-          <Input
-            value={settings.domain}
-            onChange={(e) =>
-              setSettings((p) => ({ ...p, domain: e.target.value }))
-            }
-            placeholder={t("admin.sslDomainPlaceholder")}
-            className="text-xs"
-          />
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
-            {t("admin.sslEmail")}
-          </label>
-          <Input
-            value={settings.email}
-            onChange={(e) =>
-              setSettings((p) => ({ ...p, email: e.target.value }))
-            }
-            placeholder={t("admin.sslEmailPlaceholder")}
-            className="text-xs"
-          />
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
             {t("admin.sslChallengeType")}
           </label>
-          <Select
+          <select
             value={settings.challengeType}
-            onValueChange={(v) =>
+            onChange={(e) =>
               setSettings((p) => ({
                 ...p,
-                challengeType: v as AcmeChallengeType,
+                challengeType: e.target.value as AcmeChallengeType,
               }))
             }
+            className="w-full px-2 py-1.5 text-xs bg-background border border-border text-foreground outline-none focus:ring-1 focus:ring-ring"
           >
-            <SelectTrigger size="sm" className="w-full text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="http-webroot" className="text-xs">
-                HTTP (webroot)
-              </SelectItem>
-              <SelectItem value="dns-cloudflare" className="text-xs">
-                DNS (Cloudflare)
-              </SelectItem>
-            </SelectContent>
-          </Select>
+            <option value="http-webroot">HTTP (webroot)</option>
+            <option value="dns-cloudflare">DNS (Cloudflare)</option>
+            <option value="manual">{t("admin.sslManualOption")}</option>
+          </select>
           <span className="text-[10px] text-muted-foreground">
             {t("admin.sslChallengeTypeDesc")}
           </span>
         </div>
+
+        {settings.challengeType !== "manual" && (
+          <>
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
+                {t("admin.sslDomain")}
+              </label>
+              <Input
+                value={settings.domain}
+                onChange={(e) =>
+                  setSettings((p) => ({ ...p, domain: e.target.value }))
+                }
+                placeholder={t("admin.sslDomainPlaceholder")}
+                className="text-xs"
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
+                {t("admin.sslEmail")}
+              </label>
+              <Input
+                value={settings.email}
+                onChange={(e) =>
+                  setSettings((p) => ({ ...p, email: e.target.value }))
+                }
+                placeholder={t("admin.sslEmailPlaceholder")}
+                className="text-xs"
+              />
+            </div>
+          </>
+        )}
 
         {settings.challengeType === "dns-cloudflare" && (
           <div className="flex flex-col gap-1">
@@ -1185,34 +1287,86 @@ export function AdminSSLSection({
           </div>
         )}
 
+        {settings.challengeType === "manual" && (
+          <>
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
+                {t("admin.sslManualCert")}
+              </label>
+              <textarea
+                rows={5}
+                value={manualCertDraft}
+                onChange={(e) => setManualCertDraft(e.target.value)}
+                placeholder={t("admin.sslManualCertPlaceholder")}
+                spellCheck={false}
+                className="w-full px-2 py-1.5 text-[10px] font-mono bg-background border border-border text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-1 focus:ring-ring"
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
+                {t("admin.sslManualKey")}
+              </label>
+              <textarea
+                rows={5}
+                value={manualKeyDraft}
+                onChange={(e) => setManualKeyDraft(e.target.value)}
+                placeholder={t("admin.sslManualKeyPlaceholder")}
+                spellCheck={false}
+                className="w-full px-2 py-1.5 text-[10px] font-mono bg-background border border-border text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-1 focus:ring-ring"
+              />
+              <span className="text-[10px] text-muted-foreground">
+                {t("admin.sslManualDesc")}
+              </span>
+            </div>
+
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand h-7"
+              onClick={handleManualUpload}
+              disabled={manualUploading}
+            >
+              <RefreshCw
+                className={`size-3 ${manualUploading ? "animate-spin" : ""}`}
+              />
+              {manualUploading
+                ? t("admin.sslManualUploadLoading")
+                : t("admin.sslManualUpload")}
+            </Button>
+          </>
+        )}
+
         <span className="text-[10px] text-muted-foreground border-t border-border pt-2">
           {t("admin.sslInfoNote")}
         </span>
 
-        <div className="flex flex-col gap-1.5">
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand h-7"
-            onClick={handleSave}
-          >
-            {t("admin.sslSave")}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand h-7"
-            onClick={handleRequest}
-            disabled={requesting}
-          >
-            <RefreshCw
-              className={`size-3 ${requesting ? "animate-spin" : ""}`}
-            />
-            {requesting
-              ? t("admin.sslRequestCertLoading")
-              : t("admin.sslRequestCert")}
-          </Button>
-        </div>
+        {settings.challengeType !== "manual" && (
+          <div className="flex flex-col gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand h-7"
+              onClick={handleSave}
+            >
+              {t("admin.sslSave")}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full text-xs border-accent-brand/40 text-accent-brand hover:bg-accent-brand/10 hover:text-accent-brand h-7"
+              onClick={handleRequest}
+              disabled={requesting}
+            >
+              <RefreshCw
+                className={`size-3 ${requesting ? "animate-spin" : ""}`}
+              />
+              {requesting
+                ? t("admin.sslRequestCertLoading")
+                : t("admin.sslRequestCert")}
+            </Button>
+          </div>
+        )}
       </div>
     </AccordionSection>
   );

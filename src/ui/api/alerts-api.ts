@@ -4,7 +4,7 @@ export interface NotificationChannel {
   id: number;
   userId: string;
   name: string;
-  type: "webhook" | "ntfy";
+  type: "webhook" | "ntfy" | "discord";
   config: string;
   enabled: boolean;
   createdAt: string;
@@ -40,6 +40,28 @@ export interface AlertFiring {
   ruleName?: string;
 }
 
+function stringValue(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function numberValue(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function nullableNumberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function boolValue(value: unknown): boolean {
+  return value === true || value === 1 || value === "1";
+}
+
+function severityValue(value: unknown): AlertFiring["severity"] {
+  return value === "info" || value === "critical" || value === "warning"
+    ? value
+    : "warning";
+}
+
 export async function getNotificationChannels(): Promise<
   NotificationChannel[]
 > {
@@ -47,8 +69,19 @@ export async function getNotificationChannels(): Promise<
   return res.data;
 }
 
+export type NotificationChannelPayload = Partial<
+  Omit<NotificationChannel, "config">
+> & {
+  // When creating/updating the channel the UI may pass a parsed object
+  // for `config` (e.g., { url, username }) — the backend stores it as
+  // a JSON string. Accept either a string or any structured object here.
+  // Use `unknown` to allow the component-local config types to be passed
+  // without importing them into this module.
+  config: string | unknown;
+};
+
 export async function createNotificationChannel(
-  data: Partial<NotificationChannel>,
+  data: NotificationChannelPayload,
 ): Promise<NotificationChannel> {
   const res = await rbacApi.post("/notification-channels", data);
   return res.data;
@@ -56,7 +89,7 @@ export async function createNotificationChannel(
 
 export async function updateNotificationChannel(
   id: number,
-  data: Partial<NotificationChannel>,
+  data: NotificationChannelPayload,
 ): Promise<NotificationChannel> {
   const res = await rbacApi.put(`/notification-channels/${id}`, data);
   return res.data;
@@ -67,7 +100,11 @@ export async function deleteNotificationChannel(id: number): Promise<void> {
 }
 
 export async function testNotificationChannel(id: number): Promise<void> {
-  await rbacApi.post(`/notification-channels/${id}/test`);
+  const res = await rbacApi.post(`/notification-channels/${id}/test`);
+  const data = res.data as { success?: boolean; error?: string };
+  if (data && data.success === false) {
+    throw new Error(data.error || "Test notification failed");
+  }
 }
 
 function mapRule(r: Record<string, unknown>): AlertRule {
@@ -79,8 +116,7 @@ function mapRule(r: Record<string, unknown>): AlertRule {
     enabled: Boolean(r.enabled),
     triggerType: (r.trigger_type ?? r.triggerType) as string,
     thresholdValue: (r.threshold_value ?? r.thresholdValue ?? null) as
-      | number
-      | null,
+      number | null,
     thresholdDurationSeconds: (r.threshold_duration_seconds ??
       r.thresholdDurationSeconds ??
       null) as number | null,
@@ -88,6 +124,23 @@ function mapRule(r: Record<string, unknown>): AlertRule {
     createdAt: (r.created_at ?? r.createdAt) as string,
     updatedAt: (r.updated_at ?? r.updatedAt) as string,
     channelIds: Array.isArray(r.channels) ? (r.channels as number[]) : [],
+  };
+}
+
+export function mapAlertFiring(r: Record<string, unknown>): AlertFiring {
+  return {
+    id: numberValue(r.id),
+    userId: stringValue(r.userId ?? r.user_id),
+    ruleId: numberValue(r.ruleId ?? r.rule_id),
+    hostId: numberValue(r.hostId ?? r.host_id),
+    hostName: stringValue(r.hostName ?? r.host_name),
+    firedAt: stringValue(r.firedAt ?? r.fired_at, new Date(0).toISOString()),
+    resolvedAt: stringValue(r.resolvedAt ?? r.resolved_at) || null,
+    value: nullableNumberValue(r.value),
+    message: stringValue(r.message),
+    severity: severityValue(r.severity),
+    acknowledged: boolValue(r.acknowledged),
+    ruleName: stringValue(r.ruleName ?? r.rule_name) || undefined,
   };
 }
 
@@ -121,7 +174,13 @@ export async function getAlertFirings(opts?: {
   acknowledged?: boolean;
 }): Promise<AlertFiring[]> {
   const res = await rbacApi.get("/alert-firings", { params: opts });
-  return (res.data as { firings: AlertFiring[] }).firings ?? res.data;
+  const data = res.data as { firings?: unknown } | unknown[];
+  const rows = Array.isArray(data)
+    ? data
+    : Array.isArray(data.firings)
+      ? data.firings
+      : [];
+  return rows.map((row) => mapAlertFiring(row as Record<string, unknown>));
 }
 
 export async function acknowledgeAlertFiring(id: number): Promise<void> {

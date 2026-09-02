@@ -1,9 +1,61 @@
+import type { AuthOverrideProtocol } from "../../../types/auth-protocols.js";
+
 export function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
 export function isValidPort(port: unknown): port is number {
   return typeof port === "number" && port > 0 && port <= 65535;
+}
+
+export function isOptionalBoolean(
+  value: unknown,
+): value is boolean | undefined {
+  return value === undefined || typeof value === "boolean";
+}
+
+export const OWNER_PRIVATE_AUTH_FIELDS = {
+  ssh: [
+    "authType",
+    "authMethod",
+    "credentialId",
+    "vaultProfileId",
+    "overrideCredentialUsername",
+    "shareSshAuth",
+    "password",
+    "key",
+    "keyPassword",
+    "keyType",
+    "sudoPassword",
+  ],
+  rdp: [
+    "rdpAuthType",
+    "rdpCredentialId",
+    "rdpUser",
+    "rdpPassword",
+    "rdpDomain",
+  ],
+  vnc: ["vncAuthType", "vncCredentialId", "vncUser", "vncPassword"],
+  telnet: [
+    "telnetAuthType",
+    "telnetCredentialId",
+    "telnetUser",
+    "telnetPassword",
+  ],
+} as const satisfies Record<AuthOverrideProtocol, readonly string[]>;
+
+export const OWNER_PRIVATE_TERMINAL_CONFIG_FIELDS = [
+  "sudoPassword",
+  "agentSocketPath",
+] as const;
+
+export function containsOwnerPrivateAuthUpdate(
+  hostData: Record<string, unknown>,
+  protocol: AuthOverrideProtocol,
+): boolean {
+  return OWNER_PRIVATE_AUTH_FIELDS[protocol].some((field) =>
+    Object.prototype.hasOwnProperty.call(hostData, field),
+  );
 }
 
 export const FOLDER_PATH_SEPARATOR = " / ";
@@ -102,6 +154,7 @@ export type NormalizedImportedHost = Record<string, unknown> & {
   enableDocker?: unknown;
   enableProxmox?: unknown;
   enableTmuxMonitor?: unknown;
+  enableTerminalToolbar?: unknown;
   showTerminalInSidebar?: unknown;
   showFileManagerInSidebar?: unknown;
   showTunnelInSidebar?: unknown;
@@ -115,6 +168,8 @@ export type NormalizedImportedHost = Record<string, unknown> & {
   statsConfig?: unknown;
   dockerConfig?: unknown;
   proxmoxConfig?: unknown;
+  enableProxmoxStats?: unknown;
+  proxmoxStatsConfig?: unknown;
   terminalConfig?: unknown;
   forceKeyboardInteractive?: unknown;
   notes?: unknown;
@@ -221,14 +276,143 @@ export function stripSensitiveFields(
   host: Record<string, unknown>,
 ): Record<string, unknown> {
   const result = { ...host };
+  const terminalConfigForSudo =
+    host.terminalConfig &&
+    typeof host.terminalConfig === "object" &&
+    !Array.isArray(host.terminalConfig)
+      ? (host.terminalConfig as Record<string, unknown>)
+      : undefined;
   result.hasKey = !!host.key;
   result.hasKeyPassword = !!host.keyPassword;
   result.hasPassword = !!host.password;
-  result.hasSudoPassword = !!host.sudoPassword;
+  result.hasSudoPassword =
+    !!host.sudoPassword || !!terminalConfigForSudo?.sudoPassword;
+  result.hasRdpPassword = !!host.rdpPassword;
+  result.hasVncPassword = !!host.vncPassword;
+  result.hasTelnetPassword = !!host.telnetPassword;
   for (const field of SENSITIVE_FIELDS) {
     delete result[field];
   }
+  if (
+    result.terminalConfig &&
+    typeof result.terminalConfig === "object" &&
+    !Array.isArray(result.terminalConfig)
+  ) {
+    const terminalConfig = {
+      ...(result.terminalConfig as Record<string, unknown>),
+    };
+    delete terminalConfig.sudoPassword;
+    result.terminalConfig = terminalConfig;
+  }
   return result;
+}
+
+// Connection essentials a connect-level recipient is allowed to see.
+const CONNECT_LEVEL_FIELDS = new Set([
+  "id",
+  "userId",
+  "ownerId",
+  "ownerUsername",
+  "isShared",
+  "permissionLevel",
+  "sharedExpiresAt",
+  "name",
+  "ip",
+  "port",
+  "username",
+  "folder",
+  "tags",
+  "pin",
+  "authType",
+  "shareSshAuth",
+  "authOverrides",
+  "connectionType",
+  "enableTerminal",
+  "enableTunnel",
+  "enableFileManager",
+  "enableDocker",
+  "enableProxmox",
+  "enableProxmoxStats",
+  "enableTmuxMonitor",
+  "enableTerminalToolbar",
+  "showTerminalInSidebar",
+  "showFileManagerInSidebar",
+  "showTunnelInSidebar",
+  "showDockerInSidebar",
+  "showServerStatsInSidebar",
+  "enableSsh",
+  "enableRdp",
+  "enableVnc",
+  "enableTelnet",
+  "sshPort",
+  "rdpPort",
+  "vncPort",
+  "telnetPort",
+  "defaultPath",
+  "scpLegacy",
+  "tunnelConnections",
+  "jumpHosts",
+  "createdAt",
+  "updatedAt",
+]);
+
+/**
+ * Shapes a shared host row for its recipient. Secrets are always stripped
+ * (all levels); connect-level recipients are additionally reduced to
+ * connection essentials since they may not view the host's configuration.
+ */
+export function sanitizeHostForRecipient(
+  host: Record<string, unknown>,
+  permissionLevel: string | undefined,
+): Record<string, unknown> {
+  const stripped = stripSensitiveFields(host);
+  delete stripped.credentialId;
+  delete stripped.overrideCredentialUsername;
+  // Sub-host nesting is per-owner tree structure; a recipient generally
+  // can't see (or share permission on) the parent host row, so a shared
+  // host always renders at root rather than leaking another host's id.
+  delete stripped.parentHostId;
+  if (
+    stripped.terminalConfig &&
+    typeof stripped.terminalConfig === "object" &&
+    !Array.isArray(stripped.terminalConfig)
+  ) {
+    const terminalConfig = {
+      ...(stripped.terminalConfig as Record<string, unknown>),
+    };
+    delete terminalConfig.agentSocketPath;
+    stripped.terminalConfig = terminalConfig;
+  }
+  const authOverrides =
+    stripped.authOverrides &&
+    typeof stripped.authOverrides === "object" &&
+    !Array.isArray(stripped.authOverrides)
+      ? (stripped.authOverrides as Record<string, unknown>)
+      : undefined;
+  const sshOverride =
+    authOverrides?.ssh &&
+    typeof authOverrides.ssh === "object" &&
+    !Array.isArray(authOverrides.ssh)
+      ? (authOverrides.ssh as Record<string, unknown>)
+      : undefined;
+  if (!sshOverride?.credentialId) {
+    stripped.hasPassword = false;
+    stripped.hasKey = false;
+    stripped.hasKeyPassword = false;
+    stripped.hasSudoPassword = false;
+  }
+
+  if (permissionLevel !== "connect") {
+    return stripped;
+  }
+
+  const reduced: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(stripped)) {
+    if (CONNECT_LEVEL_FIELDS.has(key)) {
+      reduced[key] = value;
+    }
+  }
+  return reduced;
 }
 
 export function transformHostResponse(
@@ -243,12 +427,15 @@ export function transformHostResponse(
           : []
         : [],
     pin: !!host.pin,
+    shareSshAuth: !!host.shareSshAuth,
     enableTerminal: !!host.enableTerminal,
     enableTunnel: !!host.enableTunnel,
     enableFileManager: host.enableFileManager !== false,
     enableDocker: !!host.enableDocker,
     enableProxmox: !!host.enableProxmox,
+    enableProxmoxStats: !!host.enableProxmoxStats,
     enableTmuxMonitor: !!host.enableTmuxMonitor,
+    enableTerminalToolbar: host.enableTerminalToolbar !== false,
     showTerminalInSidebar: !!host.showTerminalInSidebar,
     showFileManagerInSidebar: !!host.showFileManagerInSidebar,
     showTunnelInSidebar: !!host.showTunnelInSidebar,
@@ -299,6 +486,9 @@ export function transformHostResponse(
       : undefined,
     proxmoxConfig: host.proxmoxConfig
       ? JSON.parse(host.proxmoxConfig as string)
+      : undefined,
+    proxmoxStatsConfig: host.proxmoxStatsConfig
+      ? JSON.parse(host.proxmoxStatsConfig as string)
       : undefined,
     forceKeyboardInteractive: host.forceKeyboardInteractive === "true",
     useWarpgate: !!host.useWarpgate,

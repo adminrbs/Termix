@@ -1,6 +1,6 @@
 import { authApi, handleApiError } from "@/main-axios";
 
-export type AcmeChallengeType = "http-webroot" | "dns-cloudflare";
+export type AcmeChallengeType = "http-webroot" | "dns-cloudflare" | "manual";
 
 export type AcmeSettings = {
   enabled: boolean;
@@ -36,12 +36,24 @@ export async function updateAcmeSslSettings(
 }
 
 export async function requestAcmeCertificate(): Promise<
-  AcmeSettings & { success: boolean }
+  AcmeSettings & { success: boolean; reloadMessage?: string }
 > {
   try {
     const response = await authApi.post("/users/acme-ssl-request", {});
     return response.data;
   } catch (error) {
     handleApiError(error, "request ACME certificate");
+  }
+}
+
+export async function uploadManualSslCertificate(payload: {
+  certificate: string;
+  privateKey: string;
+}): Promise<AcmeSettings & { success: boolean; reloadMessage?: string }> {
+  try {
+    const response = await authApi.post("/users/manual-ssl-upload", payload);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "upload manual SSL certificate");
   }
 }

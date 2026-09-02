@@ -14,8 +14,11 @@ import type {
   WidgetComponentProps,
 } from "@/types/homepage-types";
 import { GRID_SIZE } from "@/types/homepage-types";
-import { getAlertFirings, acknowledgeAlertFiring } from "@/api/alerts-api";
-import type { AlertFiring } from "@/api/alerts-api";
+import {
+  acknowledgeAlertFiring,
+  getAlertFirings,
+  type AlertFiring,
+} from "@/api/alerts-api";
 import { WidgetTitle } from "./WidgetTitle";
 
 function relativeTime(ts: string): string {
@@ -61,8 +64,35 @@ function AlertFeedWidget({
 
   useEffect(() => {
     fetchData();
-    const iv = setInterval(fetchData, 30_000);
-    return () => clearInterval(iv);
+
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (intervalId !== null) return;
+      intervalId = setInterval(() => {
+        if (document.visibilityState === "hidden") return;
+        void fetchData();
+      }, 30_000);
+    };
+    const stop = () => {
+      if (intervalId === null) return;
+      clearInterval(intervalId);
+      intervalId = null;
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        stop();
+        return;
+      }
+      void fetchData();
+      start();
+    };
+
+    if (document.visibilityState !== "hidden") start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [maxItems, showAcknowledged]);
 
   const handleAck = async (id: number) => {

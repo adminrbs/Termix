@@ -13,6 +13,9 @@ import {
   ChevronUp,
   ChevronDown,
   ChevronsLeftRight,
+  FolderOpen,
+  Touchpad,
+  MousePointer,
 } from "lucide-react";
 import {
   Tooltip,
@@ -20,20 +23,28 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/tooltip.tsx";
-import type { GuacamoleDisplayHandle } from "@/features/guacamole/GuacamoleDisplay.tsx";
+import type {
+  GuacamoleDisplayHandle,
+  GuacamoleTouchMode,
+} from "@/features/guacamole/GuacamoleDisplay.tsx";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 
 interface GuacamoleToolbarProps {
   displayRef: React.RefObject<GuacamoleDisplayHandle>;
   protocol: "rdp" | "vnc" | "telnet";
+  touchMode?: GuacamoleTouchMode | null;
+  hasFilesystem?: boolean;
+  fileBrowserOpen?: boolean;
+  onToggleFileBrowser?: () => void;
+  onTouchModeChange?: (mode: GuacamoleTouchMode) => void;
 }
 
 const MODIFIER_KEYSYMS = {
   ctrl: 0xffe3,
   alt: 0xffe9,
   shift: 0xffe1,
-  win: 0xff67,
+  win: 0xffeb,
 } as const;
 
 const FKEY_KEYSYMS = Array.from({ length: 12 }, (_, i) => 0xffbe + i);
@@ -107,6 +118,11 @@ function TipIconBtn({
 export const GuacamoleToolbar: React.FC<GuacamoleToolbarProps> = ({
   displayRef,
   protocol,
+  touchMode,
+  hasFilesystem = false,
+  fileBrowserOpen = false,
+  onToggleFileBrowser,
+  onTouchModeChange,
 }) => {
   const { t } = useTranslation();
   const [position, setPosition] = useState({ x: 0, y: 12 });
@@ -287,6 +303,53 @@ export const GuacamoleToolbar: React.FC<GuacamoleToolbarProps> = ({
               </TooltipContent>
             </Tooltip>
 
+            {/* Touch mode toggle — touch devices only */}
+            {touchMode != null && onTouchModeChange && (
+              <>
+                <div className={SEP} />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onTouchModeChange(
+                          touchMode === "touchscreen"
+                            ? "touchpad"
+                            : "touchscreen",
+                        )
+                      }
+                      className={cn(BTN_ICON)}
+                    >
+                      {touchMode === "touchscreen" ? (
+                        <MousePointer className="size-3.5" />
+                      ) : (
+                        <Touchpad className="size-3.5" />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" sideOffset={6}>
+                    {touchMode === "touchscreen"
+                      ? t("guacamole.toolbar.switchToTrackpad")
+                      : t("guacamole.toolbar.switchToTouch")}
+                  </TooltipContent>
+                </Tooltip>
+              </>
+            )}
+
+            {/* Drive files — only once guacd reports a redirected filesystem */}
+            {hasFilesystem && onToggleFileBrowser && (
+              <>
+                <div className={SEP} />
+                <TipIconBtn
+                  tooltip={t("guacamole.files.title")}
+                  onClick={onToggleFileBrowser}
+                  className={cn(fileBrowserOpen && "bg-muted text-foreground")}
+                >
+                  <FolderOpen className="size-3.5" />
+                </TipIconBtn>
+              </>
+            )}
+
             {/* System combos — RDP/VNC only */}
             {isRdpVnc && (
               <>
@@ -299,13 +362,13 @@ export const GuacamoleToolbar: React.FC<GuacamoleToolbarProps> = ({
                 </TipBtn>
                 <TipBtn
                   tooltip={t("guacamole.toolbar.winL")}
-                  onClick={() => sendCombo(0xff67, 0x006c)}
+                  onClick={() => sendCombo(MODIFIER_KEYSYMS.win, 0x006c)}
                 >
                   Win+L
                 </TipBtn>
                 <TipBtn
                   tooltip={t("guacamole.toolbar.winKey")}
-                  onClick={() => sendCombo(0xff67)}
+                  onClick={() => sendCombo(MODIFIER_KEYSYMS.win)}
                 >
                   Win
                 </TipBtn>

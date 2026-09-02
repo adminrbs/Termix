@@ -10,6 +10,7 @@ import { GRID_SIZE } from "@/types/homepage-types";
 import { getVersionInfo, getDatabaseHealth } from "@/api/system-status-api";
 import { getUptime } from "@/api/dashboard-api";
 import { WidgetTitle } from "./WidgetTitle";
+import { runVisibleInterval } from "../use-visible-interval";
 
 interface InfoRowProps {
   label: string;
@@ -46,9 +47,14 @@ function SystemOverviewWidget({
   const fetchData = async () => {
     try {
       if (showVersion) {
-        const info = await getVersionInfo(false);
+        // `checkRemote=false` makes /version return early with just
+        // {localVersion, status: "update_check_disabled"}, and the response has
+        // no `updateAvailable` field in either mode -- so the previous read was
+        // false twice over. `status` is what the endpoint actually answers with,
+        // and what the dashboard and profile badges already read.
+        const info = await getVersionInfo();
         setVersion((info?.localVersion as string) ?? null);
-        setUpdateAvailable(Boolean(info?.updateAvailable));
+        setUpdateAvailable(info?.status === "requires_update");
       }
       if (showDbHealth) {
         const health = await getDatabaseHealth();
@@ -65,8 +71,9 @@ function SystemOverviewWidget({
 
   useEffect(() => {
     fetchData();
-    const iv = setInterval(fetchData, 300_000);
-    return () => clearInterval(iv);
+    return runVisibleInterval(() => {
+      void fetchData();
+    }, 300_000);
   }, [showVersion, showDbHealth, showUptime]);
 
   const accent =
@@ -91,7 +98,7 @@ function SystemOverviewWidget({
         )}
         {showVersion && updateAvailable && (
           <InfoRow
-            label={t("homepage.overviewUpdate")}
+            label={t("homepage.overviewUpdateLabel")}
             value={t("homepage.overviewUpdateAvailable")}
             valueColor="#f97316"
           />

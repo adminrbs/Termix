@@ -1,21 +1,62 @@
 import axios from "axios";
-import { authApi, handleApiError, tunnelApi } from "@/main-axios";
+import {
+  authApi,
+  handleApiError,
+  tunnelApi,
+  getRemoteTunnelApi,
+  isElectron,
+} from "@/main-axios";
 import type {
   C2STunnelPreset,
   TunnelConfig,
   TunnelConnection,
   TunnelStatus,
 } from "@/types/index";
+import { streamServerSentEvents } from "./sse-stream";
+import { runAdaptivePolling } from "@/lib/adaptive-polling";
 
 // TUNNEL MANAGEMENT
 // ============================================================================
+//
+// Tunnel status is a process-local, in-memory view (no DB lookup) so it's
+// safe to read from both the embedded backend and a connected remote server
+// and merge the results. connectTunnel/disconnectTunnel/cancelTunnel are
+// NOT origin-routed: they resolve the target host by numeric database id
+// against whichever backend receives the request, and a synced host has a
+// different numeric id in each database (only its syncId matches across
+// them) -- routing those calls to a remote backend would need a
+// local-id-to-remote-id resolution step that doesn't exist yet. They always
+// target the embedded local backend for now.
+
+async function isRemoteSyncConnected(): Promise<boolean> {
+  if (!isElectron()) return false;
+  try {
+    const config = (await window.electronAPI?.invoke?.(
+      "get-remote-sync-config",
+    )) as { serverUrl?: string } | null;
+    return !!config?.serverUrl;
+  } catch {
+    return false;
+  }
+}
 
 export async function getTunnelStatuses(): Promise<
   Record<string, TunnelStatus>
 > {
   try {
-    const response = await tunnelApi.get("/tunnel/status");
-    return response.data || {};
+    const [localResult, remoteConnected] = await Promise.all([
+      tunnelApi.get("/tunnel/status"),
+      isRemoteSyncConnected(),
+    ]);
+    const localStatuses = localResult.data || {};
+    if (!remoteConnected) return localStatuses;
+
+    try {
+      const remoteResult = await getRemoteTunnelApi().get("/tunnel/status");
+      return { ...localStatuses, ...(remoteResult.data || {}) };
+    } catch {
+      return localStatuses;
+    }
   } catch (error) {
     handleApiError(error, "fetch tunnel statuses");
   }
@@ -26,23 +67,94 @@ export function subscribeTunnelStatuses(
   onError?: () => void,
 ): () => void {
   const baseURL = (tunnelApi.defaults.baseURL || "").replace(/\/$/, "");
-  const source = new EventSource(`${baseURL}/tunnel/status/stream`, {
-    withCredentials: true,
-  });
+  const controller = new AbortController();
 
-  source.addEventListener("statuses", (event) => {
-    try {
-      onStatuses(JSON.parse(event.data) as Record<string, TunnelStatus>);
-    } catch {
-      onError?.();
-    }
-  });
+  let latestLocal: Record<string, TunnelStatus> = {};
+  let latestRemote: Record<string, TunnelStatus> = {};
+  let stopRemotePolling: (() => void) | null = null;
 
-  source.onerror = () => {
-    onError?.();
+  const emitMerged = () => {
+    onStatuses({ ...latestLocal, ...latestRemote });
   };
 
-  return () => source.close();
+  const waitToReconnect = () =>
+    new Promise<void>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        controller.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, 1000);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+  void (async () => {
+    while (!controller.signal.aborted) {
+      const headers = new Headers({ Accept: "text/event-stream" });
+      if (isElectron()) {
+        headers.set("X-Electron-App", "true");
+        const jwt = localStorage.getItem("jwt");
+        if (jwt) headers.set("Authorization", `Bearer ${jwt}`);
+      }
+      try {
+        await streamServerSentEvents(
+          `${baseURL}/tunnel/status/stream`,
+          { credentials: "include", headers, signal: controller.signal },
+          (event) => {
+            if (event.event !== "statuses") return;
+            try {
+              latestLocal = JSON.parse(event.data) as Record<
+                string,
+                TunnelStatus
+              >;
+              emitMerged();
+            } catch {
+              onError?.();
+            }
+          },
+        );
+        if (!controller.signal.aborted) onError?.();
+      } catch (error) {
+        const aborted =
+          controller.signal.aborted ||
+          (error instanceof DOMException && error.name === "AbortError");
+        if (!aborted) onError?.();
+      }
+      if (!controller.signal.aborted) await waitToReconnect();
+    }
+  })();
+
+  // Remote tunnel status has no SSE stream exposed to the desktop app yet,
+  // so poll it at a modest interval when a remote server is connected.
+  isRemoteSyncConnected().then((connected) => {
+    if (!connected || controller.signal.aborted) return;
+    let signature = "";
+    stopRemotePolling = runAdaptivePolling(
+      async () => {
+        const result = await getRemoteTunnelApi().get("/tunnel/status");
+        const next = result.data || {};
+        const nextSignature = JSON.stringify(next);
+        const changed = nextSignature !== signature;
+        signature = nextSignature;
+        latestRemote = next;
+        emitMerged();
+        return changed;
+      },
+      {
+        minIntervalMs: 5000,
+        maxIntervalMs: 30000,
+        stablePollsPerStep: 3,
+      },
+      { enabled: () => !controller.signal.aborted },
+    );
+  });
+
+  return () => {
+    controller.abort();
+    stopRemotePolling?.();
+  };
 }
 
 export async function getTunnelStatusByName(

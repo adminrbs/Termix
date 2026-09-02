@@ -1,3 +1,5 @@
+import { getErrorMessage } from "../../lib/error-message.js";
+import type React from "react";
 import {
   useEffect,
   useRef,
@@ -7,11 +9,28 @@ import {
   useCallback,
 } from "react";
 import Guacamole from "guacamole-common-js";
+import { Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { getGuacamoleToken, isElectron, isEmbeddedMode } from "@/main-axios.ts";
-import { SimpleLoader } from "@/lib/SimpleLoader.tsx";
+import { getGuacamoleToken, isElectron } from "@/main-axios.ts";
 import { getBasePath } from "@/lib/base-path.ts";
 import { buildGuacamoleWebSocketBaseUrl } from "./guacamole-websocket-url.ts";
+import {
+  resolveConnectionOrigin,
+  buildOriginWsUrl,
+} from "@/lib/connection-origin.ts";
+import {
+  isFirefoxBrowser,
+  isPasteShortcut,
+  pasteTextToRemote,
+} from "./guacamole-clipboard.ts";
+import { getGuacamoleDisplaySize } from "./guacamole-display-size.ts";
+import { bindPointerInput } from "./guacamole-pointer.ts";
+import {
+  getFileDropDisposition,
+  hasDraggedFiles,
+} from "./guacamole-file-drop.ts";
+import { guacStateToStage } from "@/components/connection/connection-status.ts";
+import type { ConnectionStage } from "@/types/connection-log.ts";
 
 export type GuacamoleConnectionType = "rdp" | "vnc" | "telnet";
 
@@ -36,14 +55,23 @@ export interface GuacamoleDisplayHandle {
   sendKey: (keysym: number, pressed: boolean) => void;
   sendMouse: (x: number, y: number, buttonMask: number) => void;
   setClipboard: (data: string) => void;
+  getFilesystem: () => Guacamole.Object | null;
 }
+
+export type GuacamoleTouchMode = "touchscreen" | "touchpad";
 
 interface GuacamoleDisplayProps {
   connectionConfig: GuacamoleConnectionConfig;
   isVisible: boolean;
+  touchMode?: GuacamoleTouchMode | null;
+  allowUpload?: boolean;
   onConnect?: () => void;
   onDisconnect?: () => void;
   onError?: (error: string) => void;
+  onFilesystem?: (filesystem: Guacamole.Object | null) => void;
+  onDropFiles?: (files: File[]) => void;
+  onDropUnavailable?: () => void;
+  onStageChange?: (stage: ConnectionStage) => void;
 }
 
 const isDev = import.meta.env.DEV;
@@ -52,14 +80,37 @@ export const GuacamoleDisplay = forwardRef<
   GuacamoleDisplayHandle,
   GuacamoleDisplayProps
 >(function GuacamoleDisplay(
-  { connectionConfig, isVisible, onConnect, onDisconnect, onError },
+  {
+    connectionConfig,
+    isVisible,
+    touchMode,
+    allowUpload = false,
+    onConnect,
+    onDisconnect,
+    onError,
+    onFilesystem,
+    onDropFiles,
+    onDropUnavailable,
+    onStageChange,
+  },
   ref,
 ) {
   const { t } = useTranslation();
+  // The host config pins the session resolution; without it the display follows
+  // the container.
+  const hasConfiguredSize =
+    connectionConfig.width != null && connectionConfig.height != null;
   const containerRef = useRef<HTMLDivElement>(null);
   const displayRef = useRef<HTMLDivElement>(null);
   const displayElementRef = useRef<HTMLElement | null>(null);
   const clientRef = useRef<Guacamole.Client | null>(null);
+  const filesystemRef = useRef<Guacamole.Object | null>(null);
+  // Held in a ref so tearing down the client can report the loss without
+  // rebuilding the connect callback whenever the parent re-renders.
+  const onFilesystemRef = useRef(onFilesystem);
+  onFilesystemRef.current = onFilesystem;
+  const onStageChangeRef = useRef(onStageChange);
+  onStageChangeRef.current = onStageChange;
   const keyboardRef = useRef<Guacamole.Keyboard | null>(null);
   const scaleRef = useRef<number>(1);
   const resizeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -77,6 +128,10 @@ export const GuacamoleDisplay = forwardRef<
     const client = clientRef.current;
     clientRef.current = null;
     isConnectingRef.current = false;
+    if (filesystemRef.current) {
+      filesystemRef.current = null;
+      onFilesystemRef.current?.(null);
+    }
     if (!client) return;
 
     try {
@@ -115,22 +170,24 @@ export const GuacamoleDisplay = forwardRef<
         writer.sendEnd();
       }
     },
+    getFilesystem: () => filesystemRef.current,
   }));
 
-  const getWebSocketUrl = useCallback(
+  const getWebSocketConnection = useCallback(
     async (
       containerWidth: number,
       containerHeight: number,
-    ): Promise<string | null> => {
+    ): Promise<{ url: string; query: string } | null> => {
       try {
         let token: string;
-        const protocol = connectionConfig.protocol ?? connectionConfig.type;
+        const connectionProtocol =
+          connectionConfig.protocol ?? connectionConfig.type;
 
         if (connectionConfig.token) {
           token = connectionConfig.token;
         } else {
           const data = await getGuacamoleToken({
-            protocol: protocol ?? "rdp",
+            protocol: connectionProtocol ?? "rdp",
             hostname: String(connectionConfig.hostname ?? ""),
             port: connectionConfig.port,
             username: connectionConfig.username,
@@ -151,33 +208,54 @@ export const GuacamoleDisplay = forwardRef<
           token = data.token;
         }
 
-        const width = connectionConfig.width ?? containerWidth ?? 1280;
-        const height = connectionConfig.height ?? containerHeight ?? 720;
+        const displaySize = getGuacamoleDisplaySize(
+          connectionConfig.width ?? containerWidth ?? 1280,
+          connectionConfig.height ?? containerHeight ?? 720,
+          connectionProtocol,
+          window.devicePixelRatio,
+          connectionConfig.dpi,
+        );
 
-        const wsBase = buildGuacamoleWebSocketBaseUrl({
-          isDev,
-          isElectronApp: isElectron(),
-          isEmbeddedApp: isEmbeddedMode(),
-          configuredServerUrl: (window as { configuredServerUrl?: string })
-            .configuredServerUrl,
-          basePath: getBasePath(),
-          location: window.location,
-        });
+        let wsBase: string | null;
+        if (isElectron()) {
+          const origin = await resolveConnectionOrigin({
+            connectionType: connectionProtocol,
+          });
+          wsBase = await buildOriginWsUrl({
+            origin,
+            localPort: 30008,
+            localPath: "/guacamole/websocket/",
+            remotePath: "/guacamole/websocket/",
+            includeLocalJwt: false,
+          });
+          if (!wsBase) {
+            onError?.(t("errors.remoteServerRequired"));
+            return null;
+          }
+        } else {
+          wsBase = buildGuacamoleWebSocketBaseUrl({
+            isDev,
+            isElectronApp: false,
+            isEmbeddedApp: false,
+            basePath: getBasePath(),
+            location: window.location,
+          });
+        }
 
         const params = new URLSearchParams({
           token,
-          width: String(width),
-          height: String(height),
+          width: String(displaySize.width),
+          height: String(displaySize.height),
         });
-        return `${wsBase}?${params.toString()}`;
+        if (displaySize.dpi) params.set("dpi", String(displaySize.dpi));
+        return { url: wsBase, query: params.toString() };
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : "Unknown error";
+        const errorMessage = getErrorMessage(error);
         onError?.(errorMessage);
         return null;
       }
     },
-    [connectionConfig, onError],
+    [connectionConfig, onError, t],
   );
 
   const refreshKeyboardHandlers = useCallback(() => {
@@ -272,10 +350,9 @@ export const GuacamoleDisplay = forwardRef<
     setIsReady(false);
     setHasError(false);
 
-    // Wait two frames so the container is fully laid out before measuring.
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-    );
+    // Let layout settle before measuring without depending on animation frames,
+    // which may be throttled while Electron windows or tabs are inactive.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (!isMountedRef.current) {
       isConnectingRef.current = false;
       return;
@@ -297,9 +374,7 @@ export const GuacamoleDisplay = forwardRef<
       (containerWidth < 100 || containerHeight < 100) && attempt < 40;
       attempt++
     ) {
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => resolve()),
-      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
       if (!isMountedRef.current) {
         isConnectingRef.current = false;
         return;
@@ -312,19 +387,28 @@ export const GuacamoleDisplay = forwardRef<
       containerHeight = window.innerHeight || 720;
     }
 
-    const wsUrl = await getWebSocketUrl(containerWidth, containerHeight);
+    const wsConnection = await getWebSocketConnection(
+      containerWidth,
+      containerHeight,
+    );
     if (!isMountedRef.current) {
       isConnectingRef.current = false;
       return;
     }
-    if (!wsUrl) {
+    if (!wsConnection) {
       isConnectingRef.current = false;
       return;
     }
 
-    const tunnel = new Guacamole.WebSocketTunnel(wsUrl);
+    const tunnel = new Guacamole.WebSocketTunnel(wsConnection.url);
     const client = new Guacamole.Client(tunnel);
     clientRef.current = client;
+    let connectWatchdog: ReturnType<typeof setTimeout> | null = null;
+    const clearConnectWatchdog = () => {
+      if (!connectWatchdog) return;
+      clearTimeout(connectWatchdog);
+      connectWatchdog = null;
+    };
 
     const display = client.getDisplay();
     const displayElement = display.getElement();
@@ -338,8 +422,34 @@ export const GuacamoleDisplay = forwardRef<
     displayElement.setAttribute("tabindex", "0");
     displayElement.style.outline = "none";
 
+    const useNativePasteFallback = isFirefoxBrowser();
+    if (useNativePasteFallback) {
+      displayElement.addEventListener(
+        "keydown",
+        (event) => {
+          if (isPasteShortcut(event)) {
+            event.stopImmediatePropagation();
+          }
+        },
+        true,
+      );
+      displayElement.addEventListener(
+        "paste",
+        (event) => {
+          if (clientRef.current !== client) return;
+          const text = event.clipboardData?.getData("text/plain");
+          if (!text) return;
+
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          pasteTextToRemote(client, text);
+        },
+        true,
+      );
+    }
+
     display.onresize = () => {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || clientRef.current !== client) return;
       rescaleDisplay(true);
       setIsReady(true);
     };
@@ -349,26 +459,22 @@ export const GuacamoleDisplay = forwardRef<
       setIsReady(true);
     }
 
-    const mouse = new Guacamole.Mouse(displayElement);
     const sendMouseState = (state: Guacamole.Mouse.State) => {
       displayElement.focus({ preventScroll: true });
       const scale = scaleRef.current;
-      const adjustedX = Math.round(state.x / scale);
-      const adjustedY = Math.round(state.y / scale);
-
       const adjustedState = new Guacamole.Mouse.State(
-        adjustedX,
-        adjustedY,
+        Math.round(state.x / scale),
+        Math.round(state.y / scale),
         state.left,
         state.middle,
         state.right,
         state.up,
         state.down,
       ) as Guacamole.Mouse.State;
-
       client.sendMouseState(adjustedState);
     };
-    mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = sendMouseState;
+
+    bindPointerInput(displayElement, touchMode, sendMouseState);
 
     const keyboard = new Guacamole.Keyboard(displayElement);
     keyboardRef.current = keyboard;
@@ -386,10 +492,14 @@ export const GuacamoleDisplay = forwardRef<
     displayElement.addEventListener("focus", handleDisplayFocus);
     displayElement.addEventListener("blur", handleDisplayBlur);
     displayElement.addEventListener("mousedown", handleDisplayFocus);
+    displayElement.addEventListener("touchstart", handleDisplayFocus, {
+      passive: true,
+    });
     refreshKeyboardHandlers();
 
     client.onstatechange = (state: number) => {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || clientRef.current !== client) return;
+      onStageChangeRef.current?.(guacStateToStage(state));
       switch (state) {
         case 0:
           break;
@@ -398,30 +508,44 @@ export const GuacamoleDisplay = forwardRef<
         case 2:
           break;
         case 3:
+          clearConnectWatchdog();
           isConnectingRef.current = false;
           setIsReady(true);
           onConnect?.();
-          if (containerRef.current) {
+          // A configured resolution is the size the session should render at;
+          // resizing it to the container would discard it. rescaleDisplay still
+          // fits that fixed display into whatever space is available.
+          if (!hasConfiguredSize && containerRef.current) {
             const rect = containerRef.current.getBoundingClientRect();
-            const w = Math.round(rect.width);
-            const h = Math.round(rect.height);
-            if (w > 0 && h > 0) client.sendSize(w, h);
+            const size = getGuacamoleDisplaySize(
+              rect.width,
+              rect.height,
+              protocol,
+              window.devicePixelRatio,
+              connectionConfig.dpi,
+            );
+            client.sendSize(size.width, size.height);
           }
           rescaleDisplay(false);
           break;
         case 4:
           break;
         case 5:
+          clearConnectWatchdog();
+          isConnectingRef.current = false;
           setIsReady(false);
+          setHasError(true);
           hasKeyboardFocusRef.current = false;
           refreshKeyboardHandlers();
+          onError?.(t("guacamole.connectionError"));
           onDisconnect?.();
           break;
       }
     };
 
     client.onerror = (error: Guacamole.Status) => {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || clientRef.current !== client) return;
+      clearConnectWatchdog();
       const errorMessage = error.message || t("guacamole.connectionError");
       setIsReady(false);
       setHasError(true);
@@ -446,6 +570,20 @@ export const GuacamoleDisplay = forwardRef<
       Guacamole.AudioPlayer.getInstance(stream, mimetype);
     };
 
+    // Only fires when the connection enables drive redirection; guacd exposes
+    // the redirected drive as a single filesystem object.
+    client.onfilesystem = (filesystem: Guacamole.Object) => {
+      if (!isMountedRef.current || clientRef.current !== client) return;
+      filesystemRef.current = filesystem;
+      onFilesystemRef.current?.(filesystem);
+
+      filesystem.onundefine = () => {
+        if (filesystemRef.current !== filesystem) return;
+        filesystemRef.current = null;
+        onFilesystemRef.current?.(null);
+      };
+    };
+
     client.onfile = (
       stream: Guacamole.InputStream,
       mimetype: string,
@@ -465,25 +603,40 @@ export const GuacamoleDisplay = forwardRef<
     };
 
     try {
-      client.connect();
+      connectWatchdog = setTimeout(() => {
+        if (
+          !isMountedRef.current ||
+          clientRef.current !== client ||
+          !isConnectingRef.current
+        ) {
+          return;
+        }
+
+        disconnectClient();
+        void connect();
+      }, 8000);
+      client.connect(wsConnection.query);
     } catch (error) {
+      clearConnectWatchdog();
       isConnectingRef.current = false;
       if (!isMountedRef.current) return;
       setIsReady(false);
       setHasError(true);
-      onError?.(
-        error instanceof Error ? error.message : t("guacamole.connectionError"),
-      );
+      onError?.(getErrorMessage(error, t("guacamole.connectionError")));
     }
   }, [
-    getWebSocketUrl,
+    getWebSocketConnection,
     onConnect,
     onDisconnect,
     onError,
     refreshKeyboardHandlers,
     rescaleDisplay,
+    disconnectClient,
     connectionConfig.protocol,
     connectionConfig.type,
+    connectionConfig.dpi,
+    hasConfiguredSize,
+    touchMode,
     t,
   ]);
 
@@ -557,10 +710,17 @@ export const GuacamoleDisplay = forwardRef<
       resizeTimeoutRef.current = setTimeout(() => {
         if (clientRef.current && containerRef.current) {
           const rect = containerRef.current.getBoundingClientRect();
-          const w = Math.round(rect.width);
-          const h = Math.round(rect.height);
-          if (w > 0 && h > 0) {
-            clientRef.current.sendSize(w, h);
+          if (rect.width > 0 && rect.height > 0) {
+            if (!hasConfiguredSize) {
+              const size = getGuacamoleDisplaySize(
+                rect.width,
+                rect.height,
+                connectionConfig.protocol ?? connectionConfig.type,
+                window.devicePixelRatio,
+                connectionConfig.dpi,
+              );
+              clientRef.current.sendSize(size.width, size.height);
+            }
             rescaleDisplay(true);
           }
         }
@@ -572,11 +732,17 @@ export const GuacamoleDisplay = forwardRef<
     return () => {
       resizeObserver.disconnect();
     };
-  }, [rescaleDisplay]);
+  }, [
+    connectionConfig.dpi,
+    connectionConfig.protocol,
+    connectionConfig.type,
+    hasConfiguredSize,
+    rescaleDisplay,
+  ]);
 
   const syncClipboard = useCallback(() => {
     const client = clientRef.current;
-    if (!client || !navigator.clipboard?.readText) return;
+    if (!client || isFirefoxBrowser() || !navigator.clipboard?.readText) return;
     navigator.clipboard
       .readText()
       .then((text) => {
@@ -608,19 +774,58 @@ export const GuacamoleDisplay = forwardRef<
     };
   }, [isReady, syncClipboard]);
 
-  const connectingMessage = t("guacamole.connecting", {
-    type: (
-      connectionConfig.protocol ||
-      connectionConfig.type ||
-      "remote"
-    ).toUpperCase(),
-  });
+  const canDropFiles = allowUpload && onDropFiles != null;
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  // Nested elements fire dragleave as the pointer crosses them, so track depth
+  // rather than clearing the highlight on the first leave.
+  const dragDepthRef = useRef(0);
+
+  const handleDragEnter = useCallback(
+    (event: React.DragEvent) => {
+      if (!hasDraggedFiles(event.dataTransfer.types)) return;
+      event.preventDefault();
+      if (!canDropFiles) return;
+      dragDepthRef.current += 1;
+      setIsDraggingFiles(true);
+    },
+    [canDropFiles],
+  );
+
+  const handleDragLeave = useCallback(() => {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (event: React.DragEvent) => {
+      if (!hasDraggedFiles(event.dataTransfer.types)) return;
+      event.preventDefault();
+      dragDepthRef.current = 0;
+      setIsDraggingFiles(false);
+
+      const files = Array.from(event.dataTransfer.files);
+      const disposition = getFileDropDisposition(
+        event.dataTransfer.types,
+        files.length,
+        canDropFiles,
+      );
+      if (disposition === "upload") onDropFiles?.(files);
+      if (disposition === "reject") onDropUnavailable?.();
+    },
+    [canDropFiles, onDropFiles, onDropUnavailable],
+  );
 
   return (
     <div
       ref={containerRef}
       className="absolute inset-0 overflow-hidden"
       style={{ backgroundColor: "var(--bg-base)" }}
+      onDragEnter={handleDragEnter}
+      onDragOver={(event) => {
+        if (hasDraggedFiles(event.dataTransfer.types)) event.preventDefault();
+      }}
+      onDragLeave={canDropFiles ? handleDragLeave : undefined}
+      onDrop={handleDrop}
     >
       <div
         ref={displayRef}
@@ -631,10 +836,14 @@ export const GuacamoleDisplay = forwardRef<
         }}
       />
 
-      <SimpleLoader
-        visible={!isReady && !hasError}
-        message={connectingMessage}
-      />
+      {isDraggingFiles && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none bg-background/70 backdrop-blur-sm">
+          <div className="flex items-center gap-2 rounded-sm border-2 border-dashed border-border px-4 py-3 text-sm font-semibold">
+            <Upload className="size-4" />
+            {t("guacamole.files.dropToUpload")}
+          </div>
+        </div>
+      )}
     </div>
   );
 });

@@ -1,81 +1,60 @@
 <!-- SUMMARY -->
 
-Major new features including serial connections, Tailscale/WireGuard support, HashiCorp Vault SSH auth, Bitwarden SSH agent, WebAuthn passkeys, Podman support, a new grid-based dashboard, host metrics history with alerting, and much more.
+Credential cloning, a WSL local terminal, Helm and GitOps deployment, an editable file manager path bar, download progress bars, and a large batch of connection, sync, and remote desktop fixes.
 
 <!-- /SUMMARY -->
 
 <!-- YOUTUBE -->
 
-https://youtu.be/c3UD4q2jW_8
+https://youtu.be/lngaePO96tM
 
 <!-- /YOUTUBE -->
 
 <!-- UPDATE_LOG -->
 
-- Termix ID with a public handle, hosted public key resolver, and built-in CA for issuing SSH certificates
-- Serial connections support
-- Tailscale and WireGuard VPN host integration with status detection
-- HashiCorp Vault SSH signer authentication
-- Bitwarden SSH agent integration
-- WebAuthn passkey authentication
-- Podman container runtime support alongside Docker
-- SSH agent forwarding support across all SSH features
-- New grid and widget-based dashboard homepage
-- Grafana-style server stats history graphs
-- Alert system with ntfy and webhook notification support
-- Host temperature metrics card
-- App fullscreen mode
-- External editor support for file manager (desktop app)
-- Safe host sharing export
-- SSH credential password fallback for key-based auth
-- Open all sessions in a folder at once
-- Custom terminal theme color support
-- Custom tunnel endpoints configuration
-- GUACD_URL environment variable support
-- App rail hover expansion setting
-- Terminal font zoom with mouse wheel
-- File manager terminals promoted to full tabs
-- Donate button on dashboard
-- PuTTY PPK SSH key support
-- Confirmation dialog when closing active host connections
-- Confirmation prompt before opening large files in the editor
-- Cross-host file manager clipboard
-- Prioritize host results in command palette search
-- Retry autostart tunnel host fetches on failure
+- Added the ability to clone an existing credential
+- Added a WSL option for the local terminal
+- Added Helm charts and a GitOps deployment setup
+- Added an editable path bar to the file manager
+- Added a progress bar for file downloads in the file manager
+- Added an identity file option so agent authentication stops after the right key
+- Added an environment variable to turn on silent OIDC login
+- Added editable model settings for AI providers
+- Improved tmux monitor performance when aggregating sessions
+- Improved Linux packaging with standard icon sizes
+
 <!-- /UPDATE_LOG -->
 
 <!-- BUG_FIXES -->
 
-- SSH port connection bug
-- VNC required argument handshake failure
-- Jump host SOCKS5 proxy selection using wrong proxy
-- Tunnel endpoint resolution failing in some configurations
-- Direct tunnel skipping endpoint credential validation incorrectly
-- Dashboard host routing ignoring protocol settings
-- Dashboard service link creation broken
-- File manager uploads failing with 400 error and missing schema migrations on upgrade
-- Large file manager uploads not chunked (chunked for files >=1.5GB)
-- File uploads over 100MB failing due to ArrayBuffer browser limit
-- File path case not preserved in file manager UI
-- File downloads unreliable in the desktop app
-- Tmux detection path handling incorrect
-- Host metrics startup polling incorrect
-- TUI terminal output highlighting incorrect
-- Runtime base path for auth callbacks incorrect
-- Windows app icon unstable
-- SSH heading syntax highlighting broken
-- Terminal link dialog layering issue
-- Electron OIDC browser authentication failures
-- Proxmox import auth fallback not working
-- OIDC role credential shares not synced for OIDC users
-- RDP connections requiring credentials when none are needed
-- VNC authentication settings not persisted
-- Guacamole unicode token corruption
-- Guacamole websocket base path incorrect
-- Guacamole disconnect during startup crash
-- Host metrics starting for non-SSH hosts
-- Sidebar host hover causing layout shift
-- Alert UI incorrectly applying Termix CSS and alert system failing to load
-- Translation key incorrect for nav close action
-- PUID HTML ownership in Docker entrypoint
+- Passkey sign in not showing up on the login screen
+- Connections through jump hosts failing
+- Jump hosts and remote desktop hosts not resolving after a sync
+- Malformed websocket messages crashing the server
+- Encrypted file manager keys not prompting for a passphrase
+- SSH agent forwarding not working with the in-memory agent
+- Two factor prompts rejecting codes longer than six digits
+- OIDC lockout with no way to recover from environment settings
+- Tailscale requests failing on some setups
+- Terminal clipboard shortcuts not working on non-QWERTY layouts
+- Rapid mobile terminal input being sent one keystroke at a time
+- HTTPS not being able to share the configured port
+- Portable imports failing on remote databases
+- Host status not showing when metrics collection is off
+- Proxmox guest credential usernames being wrong
+- File drops not working for RDP in the browser
+- Duplicate Docker HTTPS listener on startup
+- Remote sync server probe ignoring the certificate setting
+- Runtime SSL settings not being preserved
+- Automation notifications missing host details
+- Connection screens crashing outside the connection log provider
+- better-sqlite3 failing in Docker on some platforms
+- Host action rows shifting at large font sizes
+- Sidebar height jumping when hosts or credentials have tags
+- Gaps between host rows in the sidebar list
+- Rounded corners on the host list search bar
+- Image storage settings text wrapping to one word per line
+- Unclear wording on the click-to-expand host setting
+- Dragging a folder into the file manager failing to upload
+
 <!-- /BUG_FIXES -->

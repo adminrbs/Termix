@@ -1,8 +1,11 @@
-import type { Request, Response } from "express";
-import express from "express";
+import { getErrorMessage } from "../../utils/error-message.js";
+import express, { type Request, type Response } from "express";
 import https from "https";
 import http from "http";
+import { lookup } from "dns/promises";
+import { isIP } from "net";
 import { homepageLogger } from "../../utils/logger.js";
+import { isBlockedAddress } from "../../utils/safe-outbound-fetch.js";
 
 export const homepageProxyRouter = express.Router();
 
@@ -15,22 +18,61 @@ const proxyCache = new Map<string, ProxyCacheEntry>();
 const CACHE_SIZE = 50;
 const FETCH_TIMEOUT_MS = 8000;
 
-function fetchJson(url: string): Promise<unknown> {
+async function resolvePublicUrl(rawUrl: string): Promise<{
+  url: URL;
+  address: string;
+}> {
+  const url = new URL(rawUrl);
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error("Invalid URL");
+  }
+
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const addresses = isIP(hostname)
+    ? [{ address: hostname }]
+    : await lookup(hostname, { all: true, verbatim: true });
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address }) => isBlockedAddress(address))
+  ) {
+    throw new Error("Private destinations are not allowed");
+  }
+
+  return { url, address: addresses[0].address };
+}
+
+async function fetchJson(rawUrl: string): Promise<unknown> {
+  const { url, address } = await resolvePublicUrl(rawUrl);
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith("https") ? https : http;
-    const req = mod.get(url, { timeout: FETCH_TIMEOUT_MS }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
-      res.on("end", () => {
-        try {
-          const text = Buffer.concat(chunks).toString("utf-8");
-          resolve(JSON.parse(text));
-        } catch {
-          reject(new Error("Response is not valid JSON"));
-        }
-      });
-      res.on("error", reject);
-    });
+    const mod = url.protocol === "https:" ? https : http;
+    const req = mod.get(
+      {
+        protocol: url.protocol,
+        hostname: address,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        headers: { Host: url.host },
+        servername: url.protocol === "https:" ? url.hostname : undefined,
+        timeout: FETCH_TIMEOUT_MS,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          try {
+            const text = Buffer.concat(chunks).toString("utf-8");
+            resolve(JSON.parse(text));
+          } catch {
+            reject(new Error("Response is not valid JSON"));
+          }
+        });
+        res.on("error", reject);
+      },
+    );
     req.on("error", reject);
     req.on("timeout", () => {
       req.destroy();
@@ -90,7 +132,7 @@ homepageProxyRouter.get("/", async (req: Request, res: Response) => {
     proxyCache.set(targetUrl, { data, expires: Date.now() + ttl });
     res.json(data);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "Unknown error";
+    const msg = getErrorMessage(err);
     homepageLogger.warn("Proxy fetch failed", { targetUrl, msg });
     if (msg.includes("not valid JSON")) {
       return res.status(400).json({ error: "Response is not valid JSON" });

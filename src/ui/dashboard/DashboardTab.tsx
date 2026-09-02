@@ -24,12 +24,15 @@ import {
   Zap,
 } from "lucide-react";
 import { Kbd } from "@/components/kbd";
+import { VersionBadge } from "@/components/version-badge";
 import { DASHBOARD_CARDS } from "@/lib/theme";
+import { CONNECTION_STATES } from "@/types/index";
 import type { DashboardCardId, TabType, Host } from "@/types/ui-types";
 import {
   getSSHHosts,
   getUptime,
   getVersionInfo,
+  releaseUrlFrom,
   getDatabaseHealth,
   getRecentActivity,
   getTunnelStatuses,
@@ -43,6 +46,7 @@ import {
   getServiceLinks,
   createServiceLink,
   deleteServiceLink,
+  isElectron,
 } from "@/main-axios";
 import type { RecentActivityItem, ServiceLink } from "@/main-axios";
 import { useTranslation } from "react-i18next";
@@ -129,28 +133,18 @@ function StatsBarCard({
   uptimeFormatted,
   versionText,
   versionStatus,
+  releaseUrl,
   dbHealth,
 }: {
   hosts: Host[];
   uptimeFormatted: string;
   versionText: string;
   versionStatus: "up_to_date" | "requires_update" | "beta";
+  releaseUrl: string;
   dbHealth: "healthy" | "error";
 }) {
   const { t } = useTranslation();
-  const online = hosts.filter((h) => h.online).length;
-  const statusLabel =
-    versionStatus === "beta"
-      ? t("dashboard.beta").toUpperCase()
-      : versionStatus === "requires_update"
-        ? t("dashboard.updateAvailable").toUpperCase()
-        : t("dashboardTab.stable");
-  const statusColor =
-    versionStatus === "beta"
-      ? "bg-blue-500/20 text-blue-400"
-      : versionStatus === "requires_update"
-        ? "bg-yellow-500/20 text-yellow-400"
-        : "bg-accent-brand/20 text-accent-brand";
+  const online = hosts.filter((h) => h.status === "online").length;
   return (
     <Card className="grid grid-cols-4 divide-x divide-border overflow-hidden w-full h-full py-0 gap-0">
       <div className="flex flex-col justify-center px-4 py-2 gap-1">
@@ -160,11 +154,11 @@ function StatsBarCard({
         <span className="text-xl font-bold text-accent-brand leading-none">
           {versionText || "—"}
         </span>
-        <span
-          className={`text-[10px] px-1.5 py-0.5 w-fit font-semibold leading-none ${statusColor}`}
-        >
-          {statusLabel}
-        </span>
+        <VersionBadge
+          status={versionStatus}
+          releaseUrl={releaseUrl}
+          className="w-fit"
+        />
       </div>
       <div className="flex flex-col justify-center px-4 py-2 gap-1">
         <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
@@ -188,7 +182,9 @@ function StatsBarCard({
       </div>
       <div className="flex flex-col justify-center px-4 py-2 gap-1">
         <span className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
-          {t("dashboardTab.hostsOnline")}
+          {t("dashboardTab.hostsAvailable", {
+            defaultValue: "Hosts Available",
+          })}
         </span>
         <div className="flex items-baseline gap-1">
           <span className="text-xl font-bold leading-none">{online}</span>
@@ -425,7 +421,7 @@ function MetricBar({ label, value }: { label: string; value: number }) {
   );
 }
 
-function HostStatusCard({
+export function HostStatusCard({
   hosts,
   hostMetrics,
   onOpenTab,
@@ -441,7 +437,7 @@ function HostStatusCard({
 }) {
   const { t } = useTranslation();
   const statusScheme = useStatusColorScheme();
-  const online = hosts.filter((h) => h.online).length;
+  const online = hosts.filter((h) => h.status === "online").length;
   return (
     <Card className="flex flex-col overflow-hidden w-full h-full py-0 gap-0">
       <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
@@ -452,7 +448,8 @@ function HostStatusCard({
           </span>
         </div>
         <span className="text-xs text-muted-foreground">
-          {online}/{hosts.length} {t("dashboardTab.onlineLower")}
+          {online}/{hosts.length}{" "}
+          {t("dashboardTab.availableLower", { defaultValue: "Available" })}
         </span>
       </div>
       <div className="flex flex-col overflow-auto flex-1">
@@ -462,6 +459,12 @@ function HostStatusCard({
           </div>
         )}
         {hosts.map((host, i) => {
+          const availability =
+            host.status && host.status !== "unknown"
+              ? host.status
+              : host.online
+                ? "online"
+                : "offline";
           const metrics = hostMetrics.get(host.id);
           const cpu = metrics?.cpu ?? null;
           const ram = metrics?.ram ?? null;
@@ -471,24 +474,32 @@ function HostStatusCard({
             <div
               key={i}
               onClick={() => onOpenTab(host, "host-metrics")}
-              className="flex items-center justify-between px-4 py-2.5 border-b border-border last:border-0 hover:bg-muted/50 cursor-pointer group/row"
+              className="flex min-w-0 items-center justify-between px-4 py-2.5 border-b border-border last:border-0 hover:bg-muted/50 cursor-pointer group/row"
             >
-              <div className="flex items-center gap-2.5">
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
                 <span
-                  className={`size-1.5 rounded-full shrink-0 ${getStatusClasses(host.online, statusScheme, "dot", statusLoading)}`}
+                  className={`size-1.5 rounded-full shrink-0 ${getStatusClasses(availability, statusScheme, "dot", statusLoading)}`}
                 />
-                <div className="flex flex-col">
-                  <div className="flex items-center gap-1">
-                    <span className="text-xs font-semibold">{host.name}</span>
+                <div className="flex min-w-0 flex-col">
+                  <div className="flex min-w-0 items-center gap-1">
+                    <span
+                      className="truncate text-xs font-semibold"
+                      title={host.name}
+                    >
+                      {host.name}
+                    </span>
                     <ExternalLink className="size-2.5 text-muted-foreground/0 group-hover/row:text-muted-foreground/60 transition-colors shrink-0" />
                   </div>
-                  <span className="text-[10px] text-muted-foreground font-mono">
+                  <span
+                    className="truncate text-[10px] text-muted-foreground font-mono"
+                    title={host.ip}
+                  >
                     {host.ip}
                   </span>
                 </div>
               </div>
-              <div className="flex items-center gap-3">
-                {host.online && hasMetrics ? (
+              <div className="flex shrink-0 items-center gap-3">
+                {availability === "online" && hasMetrics ? (
                   <div className="flex items-center gap-3">
                     {cpu !== null && (
                       <MetricBar label={t("dashboard.cpu")} value={cpu} />
@@ -514,13 +525,19 @@ function HostStatusCard({
                   </div>
                 )}
                 <span
-                  className={`text-[10px] px-2 py-0.5 font-semibold border ${getStatusClasses(host.online, statusScheme, "badge", statusLoading)}`}
+                  className={`text-[10px] px-2 py-0.5 font-semibold border ${getStatusClasses(availability, statusScheme, "badge", statusLoading)}`}
                 >
                   {statusLoading
                     ? t("dashboardTab.checking")
-                    : host.online
-                      ? t("dashboardTab.online")
-                      : t("dashboardTab.offline")}
+                    : availability === "online"
+                      ? t("dashboardTab.available", {
+                          defaultValue: "AVAILABLE",
+                        })
+                      : availability === "reachable"
+                        ? t("dashboardTab.reachable", {
+                            defaultValue: "REACHABLE",
+                          })
+                        : t("dashboardTab.offline")}
                 </span>
               </div>
             </div>
@@ -529,6 +546,10 @@ function HostStatusCard({
       </div>
     </Card>
   );
+}
+
+function isStatusCheckEnabled(host: Host): boolean {
+  return host.statsConfig?.statusCheckEnabled !== false;
 }
 
 function RecentActivityCard({
@@ -787,6 +808,7 @@ function CardItem({
   uptimeFormatted,
   versionText,
   versionStatus,
+  releaseUrl,
   dbHealth,
   credentialCount,
   activeTunnelCount,
@@ -797,6 +819,7 @@ function CardItem({
   onAddServiceLink,
   onDeleteServiceLink,
   statusLoading,
+  isVisible = true,
 }: {
   slot: CardSlot;
   editMode: boolean;
@@ -816,6 +839,7 @@ function CardItem({
   uptimeFormatted: string;
   versionText: string;
   versionStatus: "up_to_date" | "requires_update" | "beta";
+  releaseUrl: string;
   dbHealth: "healthy" | "error";
   credentialCount: number;
   activeTunnelCount: number;
@@ -826,6 +850,7 @@ function CardItem({
   onAddServiceLink: (label: string, url: string) => Promise<void>;
   onDeleteServiceLink: (id: number) => Promise<void>;
   statusLoading?: boolean;
+  isVisible?: boolean;
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null);
 
@@ -883,6 +908,7 @@ function CardItem({
             uptimeFormatted={uptimeFormatted}
             versionText={versionText}
             versionStatus={versionStatus}
+            releaseUrl={releaseUrl}
             dbHealth={dbHealth}
           />
         )}
@@ -899,6 +925,7 @@ function CardItem({
             onOpenSingletonTab={onOpenSingletonTab}
             hosts={hosts}
             onOpenTab={onOpenTab}
+            isAdmin={isAdmin}
           />
         )}
         {slot.id === "host_status" && (
@@ -906,7 +933,6 @@ function CardItem({
             hosts={hosts}
             hostMetrics={hostMetrics}
             onOpenTab={onOpenTab}
-            isAdmin={isAdmin}
             statusLoading={statusLoading}
           />
         )}
@@ -922,6 +948,7 @@ function CardItem({
         {slot.id === "network_graph" && (
           <NetworkGraphCard
             embedded={true}
+            isVisible={isVisible}
             onOpenInNewTab={() => onOpenSingletonTab("network_graph")}
           />
         )}
@@ -1040,6 +1067,7 @@ type PanelColumnProps = {
   uptimeFormatted: string;
   versionText: string;
   versionStatus: "up_to_date" | "requires_update" | "beta";
+  releaseUrl: string;
   dbHealth: "healthy" | "error";
   credentialCount: number;
   activeTunnelCount: number;
@@ -1051,6 +1079,7 @@ type PanelColumnProps = {
   onAddServiceLink: (label: string, url: string) => Promise<void>;
   onDeleteServiceLink: (id: number) => Promise<void>;
   statusLoading: boolean;
+  isVisible?: boolean;
 };
 
 function PanelColumn({
@@ -1071,6 +1100,7 @@ function PanelColumn({
   uptimeFormatted,
   versionText,
   versionStatus,
+  releaseUrl,
   dbHealth,
   credentialCount,
   activeTunnelCount,
@@ -1082,6 +1112,7 @@ function PanelColumn({
   onAddServiceLink,
   onDeleteServiceLink,
   statusLoading,
+  isVisible = true,
 }: PanelColumnProps) {
   const { t } = useTranslation();
   const sorted = [...slots].sort((a, b) => a.order - b.order);
@@ -1128,6 +1159,7 @@ function PanelColumn({
             uptimeFormatted={uptimeFormatted}
             versionText={versionText}
             versionStatus={versionStatus}
+            releaseUrl={releaseUrl}
             dbHealth={dbHealth}
             credentialCount={credentialCount}
             activeTunnelCount={activeTunnelCount}
@@ -1138,6 +1170,7 @@ function PanelColumn({
             onAddServiceLink={onAddServiceLink}
             onDeleteServiceLink={onDeleteServiceLink}
             statusLoading={statusLoading}
+            isVisible={isVisible}
           />
         </div>
       ))}
@@ -1188,9 +1221,12 @@ function ColumnDivider({
 export function DashboardTab({
   onOpenSingletonTab,
   onOpenTab,
+  isVisible = true,
 }: {
   onOpenSingletonTab: (type: TabType, pendingEvent?: string) => void;
   onOpenTab: (host: Host, type: TabType) => void;
+  /** When false, pause dashboard metrics refresh while the tab stays mounted. */
+  isVisible?: boolean;
 }) {
   const { t, i18n } = useTranslation();
   const { initialLoadComplete } = useServerStatus();
@@ -1209,6 +1245,25 @@ export function DashboardTab({
     return DEFAULT_SLOTS;
   });
 
+  // Picking an interface preset rewrites the stored layout from the settings
+  // panel, so pick it up without waiting for a remount.
+  useEffect(() => {
+    const handler = () => {
+      try {
+        const saved = localStorage.getItem("dashboardTab.slots");
+        if (!saved) return;
+        const parsed = JSON.parse(saved) as CardSlot[];
+        setSlots(
+          parsed.map((s, i) => ({ key: s.key ?? `${s.id}_${i}`, ...s })),
+        );
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("dashboardSlotsChanged", handler);
+    return () => window.removeEventListener("dashboardSlotsChanged", handler);
+  }, []);
+
   const [homepageLinkCopied, setHomepageLinkCopied] = useState(false);
 
   const handleCopyHomepageLink = () => {
@@ -1223,8 +1278,7 @@ export function DashboardTab({
     () => {
       try {
         return (localStorage.getItem("dashboardView") ?? "dashboard") as
-          | "dashboard"
-          | "homepage";
+          "dashboard" | "homepage";
       } catch {
         return "dashboard";
       }
@@ -1275,6 +1329,7 @@ export function DashboardTab({
   const [versionStatus, setVersionStatus] = useState<
     "up_to_date" | "requires_update" | "beta"
   >("up_to_date");
+  const [releaseUrl, setReleaseUrl] = useState("");
   const [dbHealth, setDbHealth] = useState<"healthy" | "error">("healthy");
   const [credentialCount, setCredentialCount] = useState(0);
   const [activeTunnelCount, setActiveTunnelCount] = useState(0);
@@ -1283,6 +1338,7 @@ export function DashboardTab({
     Map<string, { cpu: number | null; ram: number | null; disk: number | null }>
   >(new Map());
   const viewerSessionsRef = useRef<Map<number, string>>(new Map());
+  const statusCheckHosts = hosts.filter(isStatusCheckEnabled);
 
   const fetchMetrics = useCallback(async (hostList: Host[]) => {
     let statuses: Record<number, { status?: string }> = {};
@@ -1342,13 +1398,22 @@ export function DashboardTab({
     const load = async () => {
       const raw = await getSSHHosts().catch(() => []);
       const mapped = raw.map(sshHostToHost);
+      const statusHosts = mapped.filter(isStatusCheckEnabled);
       if (mounted) setHosts(mapped);
-      fetchMetrics(mapped).catch(() => {});
+      if (isVisible) {
+        fetchMetrics(statusHosts).catch(() => {});
+      }
     };
     load();
 
     getUserInfo()
-      .then((info) => setIsAdmin(!!info.is_admin))
+      .then((info) => {
+        // Remote sync is not yet configurable (added in a later phase), so
+        // a standalone desktop install never shows admin/user-management
+        // UI -- it has exactly one implicit user and nothing to administer.
+        const isRemoteSyncConnected = false;
+        setIsAdmin(!!info.is_admin && (!isElectron() || isRemoteSyncConnected));
+      })
       .catch(() => {});
     getUptime()
       .then((u) => setUptimeFormatted(u.formatted))
@@ -1357,6 +1422,7 @@ export function DashboardTab({
       .then((info) => {
         setVersionText(info.localVersion ?? "");
         setVersionStatus(info.status ?? "up_to_date");
+        setReleaseUrl(releaseUrlFrom(info));
       })
       .catch(() => {});
     getDatabaseHealth()
@@ -1387,34 +1453,43 @@ export function DashboardTab({
     getTunnelStatuses()
       .then((statuses) => {
         const active = Object.values(statuses ?? {}).filter(
-          (s) => s?.status === "CONNECTED",
+          (s) => s?.status === CONNECTION_STATES.CONNECTED,
         ).length;
         setActiveTunnelCount(active);
       })
       .catch(() => {});
 
+    if (!isVisible) {
+      return () => {
+        mounted = false;
+      };
+    }
+
     const metricsInterval = setInterval(async () => {
+      if (document.visibilityState === "hidden") return;
       const raw = await getSSHHosts().catch(() => []);
       const mapped = raw.map(sshHostToHost);
+      const statusHosts = mapped.filter(isStatusCheckEnabled);
       if (mounted) setHosts(mapped);
-      fetchMetrics(mapped).catch(() => {});
+      fetchMetrics(statusHosts).catch(() => {});
     }, 30000);
 
     return () => {
       mounted = false;
       clearInterval(metricsInterval);
     };
-  }, [fetchMetrics]);
+  }, [fetchMetrics, isVisible]);
 
   useEffect(() => {
-    if (viewerSessionsRef.current.size === 0) return;
+    if (!isVisible || viewerSessionsRef.current.size === 0) return;
     const heartbeat = setInterval(async () => {
+      if (document.visibilityState === "hidden") return;
       for (const [, sessionId] of viewerSessionsRef.current) {
         sendMetricsHeartbeat(sessionId).catch(() => {});
       }
     }, 30000);
     return () => clearInterval(heartbeat);
-  }, [hostMetrics]);
+  }, [hostMetrics, isVisible]);
 
   const handleClearActivity = async () => {
     try {
@@ -1574,6 +1649,7 @@ export function DashboardTab({
     uptimeFormatted,
     versionText,
     versionStatus,
+    releaseUrl,
     dbHealth,
     credentialCount,
     activeTunnelCount,
@@ -1587,6 +1663,7 @@ export function DashboardTab({
     onAddServiceLink: handleAddServiceLink,
     onDeleteServiceLink: handleDeleteServiceLink,
     statusLoading,
+    isVisible,
   };
 
   const isMobile = useIsMobile();
@@ -1687,6 +1764,7 @@ export function DashboardTab({
                   uptimeFormatted={uptimeFormatted}
                   versionText={versionText}
                   versionStatus={versionStatus}
+                  releaseUrl={releaseUrl}
                   dbHealth={dbHealth}
                 />
               )}
@@ -1703,14 +1781,14 @@ export function DashboardTab({
                   onOpenSingletonTab={onOpenSingletonTab}
                   hosts={hosts}
                   onOpenTab={onOpenTab}
+                  isAdmin={isAdmin}
                 />
               )}
               {slot.id === "host_status" && (
                 <HostStatusCard
-                  hosts={hosts}
+                  hosts={statusCheckHosts}
                   hostMetrics={hostMetrics}
                   onOpenTab={onOpenTab}
-                  isAdmin={isAdmin}
                   statusLoading={statusLoading}
                 />
               )}
@@ -1726,6 +1804,7 @@ export function DashboardTab({
               {slot.id === "network_graph" && (
                 <NetworkGraphCard
                   embedded={true}
+                  isVisible={isVisible}
                   onOpenInNewTab={() => onOpenSingletonTab("network_graph")}
                 />
               )}
